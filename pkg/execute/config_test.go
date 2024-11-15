@@ -8,8 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/kubeshop/botkube/internal/loggerx"
 	"github.com/kubeshop/botkube/pkg/config"
+	"github.com/kubeshop/botkube/pkg/loggerx"
 )
 
 const (
@@ -28,7 +28,7 @@ func TestConfigExecutorShowConfig(t *testing.T) {
 			CmdCtx: CommandContext{
 				Args:           []string{"config"},
 				Conversation:   Conversation{Alias: channelAlias, ID: "conv-id"},
-				Platform:       config.SlackCommPlatformIntegration,
+				Platform:       config.SocketSlackCommPlatformIntegration,
 				ClusterName:    configTestClusterName,
 				ExecutorFilter: newExecutorTextFilter(""),
 			},
@@ -41,11 +41,8 @@ func TestConfigExecutorShowConfig(t *testing.T) {
 						actions: {}
 						sources: {}
 						executors: {}
+						aliases: {}
 						communications: {}
-						filters:
-						    kubernetes:
-						        objectAnnotationChecker: false
-						        nodeEventsChecker: false
 						analytics:
 						    disable: false
 						settings:
@@ -61,30 +58,40 @@ func TestConfigExecutorShowConfig(t *testing.T) {
 						            configMap: {}
 						    metricsPort: ""
 						    healthPort: ""
-						    lifecycleServer:
-						        enabled: false
-						        port: 0
-						        deployment: {}
 						    log:
 						        level: ""
 						        disableColors: false
+						        formatter: ""
 						    informersResyncPeriod: 0s
 						    kubeconfig: ""
+						    saCredentialsPathPrefix: ""
 						configWatcher:
 						    enabled: false
-						    initialSyncTimeout: 0s
-						    tmpDir: ""
+						    remote:
+						        pollInterval: 0s
+						    inCluster:
+						        informerResyncPeriod: 0s
+						    deployment: {}
 						plugins:
 						    cacheDir: ""
-						    repositories: {}`),
+						    repositories: {}
+						    incomingWebhook:
+						        enabled: false
+						        port: 0
+						        inClusterBaseURL: ""
+						    restartPolicy:
+						        type: ""
+						        threshold: 0
+						    healthCheckInterval: 0s
+						`),
 		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			e := NewConfigExecutor(loggerx.NewNoop(), &fakeAnalyticsReporter{}, tc.Cfg)
+			e := NewConfigExecutor(loggerx.NewNoop(), tc.Cfg)
 			msg, err := e.Show(context.Background(), tc.CmdCtx)
 			require.NoError(t, err)
-			assert.Equal(t, msg.Body.CodeBlock, tc.ExpectedResult)
+			assert.Equal(t, tc.ExpectedResult, msg.BaseBody.CodeBlock)
 		})
 	}
 }

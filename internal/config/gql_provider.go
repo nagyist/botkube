@@ -2,38 +2,35 @@ package config
 
 import (
 	"context"
-	"os"
 
 	"github.com/pkg/errors"
-	"sigs.k8s.io/yaml"
+
+	"github.com/kubeshop/botkube/internal/config/remote"
+	"github.com/kubeshop/botkube/pkg/config"
 )
+
+type DeploymentClient interface {
+	GetConfigWithResourceVersion(ctx context.Context) (remote.Deployment, error)
+}
 
 // GqlProvider is GraphQL provider
 type GqlProvider struct {
-	GqlClient GqlClient
+	client DeploymentClient
 }
 
 // NewGqlProvider initializes new GraphQL config source provider
-func NewGqlProvider(gql GqlClient) *GqlProvider {
-	return &GqlProvider{GqlClient: gql}
+func NewGqlProvider(dc DeploymentClient) *GqlProvider {
+	return &GqlProvider{client: dc}
 }
 
 // Configs returns list of config files
-func (g *GqlProvider) Configs(ctx context.Context) (YAMLFiles, error) {
-	d := os.Getenv("CONFIG_PROVIDER_IDENTIFIER")
-	if d == "" {
-		return nil, nil
-	}
-	deployment, err := g.GqlClient.GetDeployment(ctx, d)
+func (g *GqlProvider) Configs(ctx context.Context) (config.YAMLFiles, int, error) {
+	deployment, err := g.client.GetConfigWithResourceVersion(ctx)
 	if err != nil {
-		return nil, errors.Wrapf(err, "while getting deployment with id %s", d)
-	}
-	conf, err := yaml.JSONToYAML([]byte(deployment.BotkubeConfig))
-	if err != nil {
-		return nil, errors.Wrapf(err, "while converting json to yaml for deployment with id %s", d)
+		return nil, 0, errors.Wrapf(err, "while getting deployment")
 	}
 
 	return [][]byte{
-		conf,
-	}, nil
+		[]byte(deployment.YAMLConfig),
+	}, deployment.ResourceVersion, nil
 }

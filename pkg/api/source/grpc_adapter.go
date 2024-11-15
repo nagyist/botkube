@@ -2,11 +2,14 @@ package source
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
-	"log"
 
 	"github.com/hashicorp/go-plugin"
+	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/kubeshop/botkube/pkg/api"
@@ -15,6 +18,7 @@ import (
 // Source defines the Botkube source plugin functionality.
 type Source interface {
 	Stream(context.Context, StreamInput) (StreamOutput, error)
+	HandleExternalRequest(context.Context, ExternalRequestInput) (ExternalRequestOutput, error)
 	Metadata(context.Context) (api.MetadataOutput, error)
 }
 
@@ -23,13 +27,77 @@ type (
 	StreamInput struct {
 		// Configs is a list of Source configurations specified by users.
 		Configs []*Config
+		// Context holds streaming context.
+		Context StreamInputContext
+	}
+
+	// StreamInputContext holds streaming context.
+	StreamInputContext struct {
+		// KubeConfig is the path to kubectl configuration file.
+		KubeConfig []byte
+
+		CommonSourceContext
 	}
 
 	// StreamOutput holds the output of the Stream function.
 	StreamOutput struct {
-		// Output represents the streamed events. It is from start of plugin execution.
-		Output chan []byte
-		// TODO: we should consider adding error feedback channel too.
+		// Event represents the streamed events with message, raw object, and analytics data. It is from the start of plugin consumption.
+		// You can construct a complex message.data or just use one of our helper functions:
+		//   - api.NewCodeBlockMessage("body", true)
+		//   - api.NewPlaintextMessage("body", true)
+		Event chan Event
+	}
+
+	// ExternalRequestInput holds the input of the HandleExternalRequest function.
+	ExternalRequestInput struct {
+		// Payload is the payload of the incoming webhook.
+		Payload []byte
+
+		// Config is Source configuration specified by users.
+		Config *Config
+
+		// Context holds single dispatch context.
+		Context ExternalRequestInputContext
+	}
+
+	// ExternalRequestInputContext holds single ex context.
+	ExternalRequestInputContext struct {
+		CommonSourceContext
+	}
+
+	// CommonSourceContext holds common source context.
+	CommonSourceContext struct {
+		// IsInteractivitySupported is set to true only if a communication platform supports interactive Messages.
+		IsInteractivitySupported bool
+
+		// ClusterName is the name of the underlying Kubernetes cluster which is provided by end user.
+		ClusterName string
+
+		// SourceName is the name of the source plugin configuration.
+		SourceName string
+
+		IncomingWebhook IncomingWebhookDetailsContext
+	}
+
+	// IncomingWebhookDetailsContext holds incoming webhook context.
+	IncomingWebhookDetailsContext struct {
+		BaseURL          string
+		FullURLForSource string
+	}
+
+	// ExternalRequestOutput holds the output of the Stream function.
+	ExternalRequestOutput struct {
+		// Event represents the streamed events with message, raw object, and analytics data. It is from the start of plugin consumption.
+		// You can construct a complex message.data or just use one of our helper functions:
+		//   - api.NewCodeBlockMessage("body", true)
+		//   - api.NewPlaintextMessage("body", true)
+		Event Event
+	}
+
+	Event struct {
+		Message         api.Message
+		RawObject       any
+		AnalyticsLabels map[string]interface{}
 	}
 )
 
@@ -40,7 +108,7 @@ type (
 //
 // NOTE: In the future we can consider using VersionedPlugins. These can be used to negotiate
 // a compatible version between client and server. If this is set, Handshake.ProtocolVersion is not required.
-const ProtocolVersion = 1
+const ProtocolVersion = 3
 
 var _ plugin.GRPCPlugin = &Plugin{}
 
@@ -49,7 +117,7 @@ type Plugin struct {
 	// The GRPC plugin must still implement the Plugin interface.
 	plugin.NetRPCUnsupportedPlugin
 
-	// Source represent a concrete implementation that handles the business logic.
+	// Source represents a concrete implementation that handles the business logic.
 	Source Source
 }
 
@@ -65,23 +133,30 @@ func (p *Plugin) GRPCServer(_ *plugin.GRPCBroker, s *grpc.Server) error {
 func (p *Plugin) GRPCClient(_ context.Context, _ *plugin.GRPCBroker, c *grpc.ClientConn) (interface{}, error) {
 	return &grpcClient{
 		client: NewSourceClient(c),
+		logger: NewLogger(),
 	}, nil
 }
 
 type grpcClient struct {
 	client SourceClient
+	logger logrus.FieldLogger
 }
 
 func (p *grpcClient) Stream(ctx context.Context, in StreamInput) (StreamOutput, error) {
-	stream, err := p.client.Stream(ctx, &StreamRequest{
+	request := &StreamRequest{
 		Configs: in.Configs,
-	})
+		Context: &StreamContext{
+			SourceContext: sourceContextToGRPC(in.Context.CommonSourceContext),
+			KubeConfig:    in.Context.KubeConfig,
+		},
+	}
+	stream, err := p.client.Stream(ctx, request)
 	if err != nil {
 		return StreamOutput{}, err
 	}
 
 	out := StreamOutput{
-		Output: make(chan []byte),
+		Event: make(chan Event),
 	}
 
 	go func() {
@@ -96,15 +171,52 @@ func (p *grpcClient) Stream(ctx context.Context, in StreamInput) (StreamOutput, 
 			// On any other error, the stream is aborted and the error contains the RPC
 			// status.
 			if err != nil {
-				log.Print(err)
+				p.logger.Errorf("canceling streaming: %s", status.Convert(err).Message())
 				// TODO: we should consider adding error feedback channel to StreamOutput.
 				return
 			}
-			out.Output <- feature.Output
+			var event Event
+			if len(feature.Event) != 0 && string(feature.Event) != "" {
+				if err := json.Unmarshal(feature.Event, &event); err != nil {
+					p.logger.Errorf("canceling streaming: cannot unmarshal JSON message: %s", err.Error())
+					return
+				}
+			}
+			out.Event <- event
 		}
+		close(out.Event)
 	}()
 
 	return out, nil
+}
+
+func (p *grpcClient) HandleExternalRequest(ctx context.Context, in ExternalRequestInput) (ExternalRequestOutput, error) {
+	request := &ExternalRequest{
+		Payload: in.Payload,
+		Config:  in.Config,
+		Context: &ExternalRequestContext{
+			SourceContext: sourceContextToGRPC(in.Context.CommonSourceContext),
+		},
+	}
+	out, err := p.client.HandleExternalRequest(ctx, request)
+	if err != nil {
+		return ExternalRequestOutput{}, err
+	}
+
+	if len(out.Event) == 0 && string(out.Event) == "" {
+		return ExternalRequestOutput{
+			Event: Event{},
+		}, nil
+	}
+
+	var event Event
+	if err := json.Unmarshal(out.Event, &event); err != nil {
+		return ExternalRequestOutput{}, fmt.Errorf("while unmarshalling JSON message for single dispatch: %w", err)
+	}
+
+	return ExternalRequestOutput{
+		Event: event,
+	}, nil
 }
 
 func (p *grpcClient) Metadata(ctx context.Context) (api.MetadataOutput, error) {
@@ -113,13 +225,29 @@ func (p *grpcClient) Metadata(ctx context.Context) (api.MetadataOutput, error) {
 		return api.MetadataOutput{}, err
 	}
 
+	var externalRequest api.ExternalRequestMetadata
+	if resp.ExternalRequest != nil {
+		externalRequest = api.ExternalRequestMetadata{
+			Payload: api.ExternalRequestPayload{
+				JSONSchema: api.JSONSchema{
+					Value:  resp.ExternalRequest.Payload.GetJsonSchema().GetValue(),
+					RefURL: resp.ExternalRequest.Payload.GetJsonSchema().GetRefUrl(),
+				},
+			},
+		}
+	}
+
 	return api.MetadataOutput{
-		Version:     resp.Version,
-		Description: resp.Description,
+		Version:          resp.Version,
+		Description:      resp.Description,
+		DocumentationURL: resp.DocumentationUrl,
 		JSONSchema: api.JSONSchema{
 			Value:  resp.GetJsonSchema().GetValue(),
-			RefURL: resp.GetJsonSchema().GetRefURL(),
+			RefURL: resp.GetJsonSchema().GetRefUrl(),
 		},
+		ExternalRequest: externalRequest,
+		Dependencies:    api.ConvertDependenciesToAPI(resp.Dependencies),
+		Recommended:     resp.Recommended,
 	}, nil
 }
 
@@ -134,12 +262,23 @@ func (p *grpcServer) Metadata(ctx context.Context, _ *emptypb.Empty) (*MetadataR
 		return nil, err
 	}
 	return &MetadataResponse{
-		Version:     meta.Version,
-		Description: meta.Description,
+		Version:          meta.Version,
+		Description:      meta.Description,
+		DocumentationUrl: meta.DocumentationURL,
 		JsonSchema: &JSONSchema{
 			Value:  meta.JSONSchema.Value,
-			RefURL: meta.JSONSchema.RefURL,
+			RefUrl: meta.JSONSchema.RefURL,
 		},
+		ExternalRequest: &ExternalRequestMetadata{
+			Payload: &ExternalRequestPayloadMetadata{
+				JsonSchema: &JSONSchema{
+					Value:  meta.ExternalRequest.Payload.JSONSchema.Value,
+					RefUrl: meta.ExternalRequest.Payload.JSONSchema.RefURL,
+				},
+			},
+		},
+		Dependencies: api.ConvertDependenciesFromAPI[*Dependency, Dependency](meta.Dependencies),
+		Recommended:  meta.Recommended,
 	}, nil
 }
 
@@ -150,6 +289,10 @@ func (p *grpcServer) Stream(req *StreamRequest, gstream Source_StreamServer) err
 	// We can only use 'ctx' to cancel streaming and release associated resources.
 	stream, err := p.Source.Stream(ctx, StreamInput{
 		Configs: req.Configs,
+		Context: StreamInputContext{
+			KubeConfig:          req.Context.KubeConfig,
+			CommonSourceContext: sourceContextFromGRPC(req.Context.SourceContext),
+		},
 	})
 	if err != nil {
 		return err
@@ -159,19 +302,46 @@ func (p *grpcServer) Stream(req *StreamRequest, gstream Source_StreamServer) err
 		select {
 		case <-ctx.Done(): // client canceled stream, we can release this connection.
 			return ctx.Err()
-		case out, ok := <-stream.Output:
+		case msg, ok := <-stream.Event:
 			if !ok {
 				return nil // output closed, no more chunk logs
 			}
 
-			err := gstream.Send(&StreamResponse{
-				Output: out,
+			marshalled, err := json.Marshal(msg)
+			if err != nil {
+				return fmt.Errorf("while marshalling msg to byte: %w", err)
+			}
+
+			err = gstream.Send(&StreamResponse{
+				Event: marshalled,
 			})
 			if err != nil {
 				return err
 			}
 		}
 	}
+}
+
+func (p *grpcServer) HandleExternalRequest(ctx context.Context, req *ExternalRequest) (*ExternalRequestResponse, error) {
+	out, err := p.Source.HandleExternalRequest(ctx, ExternalRequestInput{
+		Payload: req.Payload,
+		Config:  req.Config,
+		Context: ExternalRequestInputContext{
+			CommonSourceContext: sourceContextFromGRPC(req.Context.SourceContext),
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	marshalled, err := json.Marshal(out.Event)
+	if err != nil {
+		return nil, fmt.Errorf("while marshalling msg to byte: %w", err)
+	}
+
+	return &ExternalRequestResponse{
+		Event: marshalled,
+	}, nil
 }
 
 // Serve serves given plugins.
@@ -185,4 +355,37 @@ func Serve(p map[string]plugin.Plugin) {
 		},
 		GRPCServer: plugin.DefaultGRPCServer,
 	})
+}
+
+func sourceContextToGRPC(in CommonSourceContext) *SourceContext {
+	return &SourceContext{
+		IsInteractivitySupported: in.IsInteractivitySupported,
+		ClusterName:              in.ClusterName,
+		SourceName:               in.SourceName,
+		IncomingWebhook: &IncomingWebhookContext{
+			BaseURL:          in.IncomingWebhook.BaseURL,
+			FullURLForSource: in.IncomingWebhook.FullURLForSource,
+		},
+	}
+}
+
+func sourceContextFromGRPC(in *SourceContext) CommonSourceContext {
+	if in == nil {
+		return CommonSourceContext{}
+	}
+
+	var incomingWebhook IncomingWebhookDetailsContext
+	if in.IncomingWebhook != nil {
+		incomingWebhook = IncomingWebhookDetailsContext{
+			BaseURL:          in.IncomingWebhook.BaseURL,
+			FullURLForSource: in.IncomingWebhook.FullURLForSource,
+		}
+	}
+
+	return CommonSourceContext{
+		IsInteractivitySupported: in.IsInteractivitySupported,
+		ClusterName:              in.ClusterName,
+		SourceName:               in.SourceName,
+		IncomingWebhook:          incomingWebhook,
+	}
 }

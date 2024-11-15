@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+option go_package = "pkg/api/cloudteams";
+
+package cloudteams;
+
+message AgentActivity {
+  // message sent by agent, either as a response to a command or an event from enabled sources
+  Message message = 2;
+}
+
+enum MessageType {
+  MESSAGE_EXECUTOR = 0;
+  MESSAGE_SOURCE = 1;
+}
+
+message Message {
+  string teamId = 1;
+  string conversationId = 3;
+  MessageType messageType = 4;
+  bytes data = 5;
+}
+
+message CloudActivity {
+  bytes event = 1;
+  string conversationDisplayName = 2;
+}
+
+service CloudTeams {
+  rpc StreamActivity(stream AgentActivity) returns (stream CloudActivity) {}
+}

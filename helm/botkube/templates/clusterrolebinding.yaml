@@ -16,4 +16,4 @@ subjects:
 - kind: ServiceAccount
   name: {{ include "botkube.serviceAccountName" . }}
   namespace: {{ .Release.Namespace }}
-{{ end }}
+{{- end }}

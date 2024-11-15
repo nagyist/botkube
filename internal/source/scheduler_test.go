@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,39 +12,40 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
-	intConfig "github.com/kubeshop/botkube/internal/config"
-	"github.com/kubeshop/botkube/internal/loggerx"
 	"github.com/kubeshop/botkube/pkg/api/source"
 	"github.com/kubeshop/botkube/pkg/config"
+	"github.com/kubeshop/botkube/pkg/loggerx"
 )
 
 func TestStartingUniqueProcesses(t *testing.T) {
 	// given
-	files := intConfig.YAMLFiles{
+	files := config.YAMLFiles{
 		readTestdataFile(t, "config.yaml"),
 	}
 	givenCfg, _, err := config.LoadWithDefaults(files)
 	require.NoError(t, err)
 
 	expectedProcesses := map[string]struct{}{
-		"botkube/keptn@v1.0.0; keptn-us-east-2; keptn-eu-central-1": {},
-		"botkube/keptn@v1.0.0; keptn-eu-central-1; keptn-us-east-2": {},
-		"botkube/keptn@v1.0.0; keptn-eu-central-1":                  {},
-		"botkube/keptn@v1.0.0; keptn-us-east-2":                     {},
+		"botkube/keptn@v1.0.0; interactive/true; keptn-us-east-2; keptn-eu-central-1": {},
+		"botkube/keptn@v1.0.0; interactive/true; keptn-eu-central-1; keptn-us-east-2": {},
+		"botkube/keptn@v1.0.0; interactive/true; keptn-eu-central-1":                  {},
+		"botkube/keptn@v1.0.0; interactive/true; keptn-us-east-2":                     {},
+
+		"botkube/keptn@v1.0.0; interactive/false; keptn-us-east-2; keptn-eu-central-1": {},
+		"botkube/keptn@v1.0.0; interactive/false; keptn-eu-central-1; keptn-us-east-2": {},
+		"botkube/keptn@v1.0.0; interactive/false; keptn-eu-central-1":                  {},
+		"botkube/keptn@v1.0.0; interactive/false; keptn-us-east-2":                     {},
 	}
 
-	assertStarter := func(ctx context.Context, pluginName string, pluginConfigs []*source.Config, sources []string) error {
+	assertStarter := func(ctx context.Context, isInteractivitySupported bool, pluginName string, pluginConfig *source.Config, sources []string) error {
 		// then configs are specified in a proper order
-		var expConfigs []*source.Config
-		for _, sourceName := range sources {
-			expConfigs = append(expConfigs, &source.Config{
-				RawYAML: mustYAMLMarshal(t, givenCfg.Sources[sourceName].Plugins[pluginName].Config),
-			})
+		var expConfig = &source.Config{
+			RawYAML: mustYAMLMarshal(t, givenCfg.Sources[sources[0]].Plugins[pluginName].Config),
 		}
-		assert.Equal(t, expConfigs, pluginConfigs)
+		assert.Equal(t, expConfig, pluginConfig)
 
 		// then only unique process are started
-		key := []string{pluginName}
+		key := []string{pluginName, fmt.Sprintf("interactive/%v", isInteractivitySupported)}
 		key = append(key, sources...)
 		processKey := strings.Join(key, "; ")
 		_, found := expectedProcesses[processKey]
@@ -55,10 +57,34 @@ func TestStartingUniqueProcesses(t *testing.T) {
 	}
 
 	// when
-	scheduler := NewScheduler(loggerx.NewNoop(), givenCfg, fakeDispatcherFunc(assertStarter))
+	scheduler := NewScheduler(context.Background(), loggerx.NewNoop(), givenCfg, fakeDispatcherFunc(assertStarter), make(chan string))
 
 	err = scheduler.Start(context.Background())
 	require.NoError(t, err)
+}
+
+func TestStartedProcesses(t *testing.T) {
+	p := &openedStreams{}
+
+	assert.False(t, p.isStartedStreamWithConfiguration("plugin1", "cfg1"))
+	assert.False(t, p.isStartedStreamWithConfiguration("plugin1", "cfg2"))
+	assert.False(t, p.isStartedStreamWithConfiguration("plugin1", "cfg3"))
+
+	p.reportStartedStreamWithConfiguration("plugin1", "cfg1")
+	p.reportStartedStreamWithConfiguration("plugin1", "cfg2")
+	p.reportStartedStreamWithConfiguration("plugin1", "cfg3")
+	p.reportStartedStreamWithConfiguration("plugin1", "cfg3")
+	p.reportStartedStreamWithConfiguration("plugin1", "cfg3")
+
+	assert.True(t, p.isStartedStreamWithConfiguration("plugin1", "cfg1"))
+	assert.True(t, p.isStartedStreamWithConfiguration("plugin1", "cfg2"))
+	assert.True(t, p.isStartedStreamWithConfiguration("plugin1", "cfg3"))
+
+	p.deleteAllStartedStreamsForPlugin("plugin1")
+
+	assert.False(t, p.isStartedStreamWithConfiguration("plugin1", "cfg1"))
+	assert.False(t, p.isStartedStreamWithConfiguration("plugin1", "cfg2"))
+	assert.False(t, p.isStartedStreamWithConfiguration("plugin1", "cfg3"))
 }
 
 func mustYAMLMarshal(t *testing.T, in any) []byte {
@@ -77,9 +103,9 @@ func readTestdataFile(t *testing.T, name string) []byte {
 
 // The fakeDispatcherFunc type is an adapter to allow the use of
 // ordinary functions as Dispatcher handlers.
-type fakeDispatcherFunc func(ctx context.Context, pluginName string, pluginConfigs []*source.Config, sources []string) error
+type fakeDispatcherFunc func(ctx context.Context, isInteractivitySupported bool, pluginName string, pluginConfig *source.Config, sources []string) error
 
 // ServeHTTP calls f(w, r).
-func (f fakeDispatcherFunc) Dispatch(ctx context.Context, pluginName string, pluginConfigs []*source.Config, sources []string) error {
-	return f(ctx, pluginName, pluginConfigs, sources)
+func (f fakeDispatcherFunc) Dispatch(dispatch PluginDispatch) error {
+	return f(dispatch.ctx, dispatch.isInteractivitySupported, dispatch.pluginName, dispatch.pluginConfig, []string{dispatch.sourceName})
 }

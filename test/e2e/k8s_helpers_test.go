@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"botkube.io/botube/test/commplatform"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -19,7 +20,11 @@ import (
 	deploymentutil "k8s.io/kubectl/pkg/util/deployment"
 )
 
-func setTestEnvsForDeploy(t *testing.T, appCfg Config, deployNsCli appsv1cli.DeploymentInterface, driverType DriverType, channels map[string]Channel, pluginRepoURL string) func(t *testing.T) {
+const (
+	pollInterval = 1 * time.Second
+)
+
+func setTestEnvsForDeploy(t *testing.T, appCfg Config, deployNsCli appsv1cli.DeploymentInterface, driverType commplatform.DriverType, channels map[string]commplatform.Channel, pluginRepoURL string) func(t *testing.T) {
 	t.Helper()
 
 	deployment, err := deployNsCli.Get(context.Background(), appCfg.Deployment.Name, metav1.GetOptions{})
@@ -49,25 +54,34 @@ func setTestEnvsForDeploy(t *testing.T, appCfg Config, deployNsCli appsv1cli.Dep
 		require.NoError(t, err)
 	}
 
+	enabled := strconv.FormatBool(true)
 	newEnvs := []v1.EnvVar{
 		{
 			Name:  appCfg.Deployment.Envs.BotkubePluginRepoURL,
 			Value: pluginRepoURL,
 		},
+		{
+			Name:  appCfg.Deployment.Envs.StandaloneActionEnabledName,
+			Value: enabled,
+		},
+		{
+			Name:  appCfg.Deployment.Envs.LabelActionEnabledName,
+			Value: enabled,
+		},
 	}
 
-	if len(channels) > 0 && driverType == SlackBot {
+	if len(channels) > 0 && driverType == commplatform.SlackBot {
 		slackEnabledEnvName := appCfg.Deployment.Envs.SlackEnabledName
-		newEnvs = append(newEnvs, v1.EnvVar{Name: slackEnabledEnvName, Value: strconv.FormatBool(true)})
+		newEnvs = append(newEnvs, v1.EnvVar{Name: slackEnabledEnvName, Value: enabled})
 
 		for envName, channel := range channels {
 			newEnvs = append(newEnvs, v1.EnvVar{Name: envName, Value: channel.Identifier()})
 		}
 	}
 
-	if len(channels) > 0 && driverType == DiscordBot {
+	if len(channels) > 0 && driverType == commplatform.DiscordBot {
 		discordEnabledEnvName := appCfg.Deployment.Envs.DiscordEnabledName
-		newEnvs = append(newEnvs, v1.EnvVar{Name: discordEnabledEnvName, Value: strconv.FormatBool(true)})
+		newEnvs = append(newEnvs, v1.EnvVar{Name: discordEnabledEnvName, Value: enabled})
 
 		for envName, channels := range channels {
 			newEnvs = append(newEnvs, v1.EnvVar{Name: envName, Value: channels.Identifier()})
@@ -88,7 +102,7 @@ func setTestEnvsForDeploy(t *testing.T, appCfg Config, deployNsCli appsv1cli.Dep
 
 func waitForDeploymentReady(deployNsCli appsv1cli.DeploymentInterface, deploymentName string, waitTimeout time.Duration) error {
 	var lastErr error
-	err := wait.Poll(pollInterval, waitTimeout, func() (done bool, err error) {
+	err := wait.PollUntilContextTimeout(context.Background(), pollInterval, waitTimeout, false, func(ctx context.Context) (done bool, err error) {
 		deployment, err := deployNsCli.Get(context.Background(), deploymentName, metav1.GetOptions{})
 		if err != nil {
 			lastErr = err
@@ -104,7 +118,7 @@ func waitForDeploymentReady(deployNsCli appsv1cli.DeploymentInterface, deploymen
 		return condition.Status == v1.ConditionTrue, nil
 	})
 	if err != nil {
-		if err == wait.ErrWaitTimeout {
+		if wait.Interrupted(err) {
 			return lastErr
 		}
 		return err

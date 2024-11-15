@@ -3,9 +3,12 @@ package sink
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -14,13 +17,12 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
 	"github.com/aws/aws-sdk-go/service/sts"
-	"github.com/olivere/elastic"
+	"github.com/olivere/elastic/v7"
 	"github.com/sha1sum/aws_signing_client"
 	"github.com/sirupsen/logrus"
 
-	"github.com/kubeshop/botkube/pkg/bot/interactive"
+	"github.com/kubeshop/botkube/internal/health"
 	"github.com/kubeshop/botkube/pkg/config"
-	"github.com/kubeshop/botkube/pkg/event"
 	"github.com/kubeshop/botkube/pkg/multierror"
 	"github.com/kubeshop/botkube/pkg/sliceutil"
 )
@@ -37,21 +39,37 @@ const (
 	// The token file mount path in POD env variable while using IAM Role for service account
 	// #nosec G101
 	awsWebIDTokenFileEnvName = "AWS_WEB_IDENTITY_TOKEN_FILE"
+
+	elasticErrorReasonResourceAlreadyExists = "resource_already_exists_exception"
 )
 
 // Elasticsearch provides integration with the Elasticsearch solution.
 type Elasticsearch struct {
-	log      logrus.FieldLogger
-	reporter AnalyticsReporter
-	client   *elastic.Client
-	indices  map[string]config.ELSIndex
+	log            logrus.FieldLogger
+	reporter       AnalyticsReporter
+	client         *elastic.Client
+	indices        map[string]config.ELSIndex
+	clusterVersion string
+	status         health.PlatformStatusMsg
+	failureReason  health.FailureReasonMsg
+	errorMsg       string
 }
 
 // NewElasticsearch creates a new Elasticsearch instance.
-func NewElasticsearch(log logrus.FieldLogger, c config.Elasticsearch, reporter AnalyticsReporter) (*Elasticsearch, error) {
+func NewElasticsearch(log logrus.FieldLogger, commGroupIdx int, c config.Elasticsearch, reporter AnalyticsReporter) (*Elasticsearch, error) {
 	var elsClient *elastic.Client
 	var err error
-	var creds *credentials.Credentials
+
+	var elsOpts []elastic.ClientOptionFunc
+	switch c.LogLevel {
+	case "info":
+		elsOpts = append(elsOpts, elastic.SetInfoLog(log))
+	case "error":
+		elsOpts = append(elsOpts, elastic.SetInfoLog(log), elastic.SetErrorLog(log))
+	case "trace":
+		elsOpts = append(elsOpts, elastic.SetInfoLog(log), elastic.SetErrorLog(log), elastic.SetTraceLog(log))
+	}
+
 	if c.AWSSigning.Enabled {
 		// Get credentials from environment variables and create the AWS Signature Version 4 signer
 		sess := session.Must(session.NewSession())
@@ -59,6 +77,7 @@ func NewElasticsearch(log logrus.FieldLogger, c config.Elasticsearch, reporter A
 		// Use OIDC token to generate credentials if using IAM to Service Account
 		awsRoleARN := os.Getenv(awsRoleARNEnvName)
 		awsWebIdentityTokenFile := os.Getenv(awsWebIDTokenFileEnvName)
+		var creds *credentials.Credentials
 		if awsRoleARN != "" && awsWebIdentityTokenFile != "" {
 			svc := sts.New(sess)
 			p := stscreds.NewWebIdentityRoleProviderWithOptions(svc, awsRoleARN, "", stscreds.FetchTokenPath(awsWebIdentityTokenFile))
@@ -74,7 +93,7 @@ func NewElasticsearch(log logrus.FieldLogger, c config.Elasticsearch, reporter A
 		if err != nil {
 			return nil, fmt.Errorf("while creating new AWS Signing client: %w", err)
 		}
-		elsClient, err = elastic.NewClient(
+		elsOpts = append(elsOpts,
 			elastic.SetURL(c.Server),
 			elastic.SetScheme("https"),
 			elastic.SetHttpClient(awsClient),
@@ -82,17 +101,14 @@ func NewElasticsearch(log logrus.FieldLogger, c config.Elasticsearch, reporter A
 			elastic.SetHealthcheck(false),
 			elastic.SetGzip(false),
 		)
-		if err != nil {
-			return nil, fmt.Errorf("while creating new Elastic client: %w", err)
-		}
 	} else {
-		elsClientParams := []elastic.ClientOptionFunc{
+		elsOpts = append(elsOpts,
 			elastic.SetURL(c.Server),
 			elastic.SetBasicAuth(c.Username, c.Password),
 			elastic.SetSniff(false),
 			elastic.SetHealthcheck(false),
 			elastic.SetGzip(true),
-		}
+		)
 
 		if c.SkipTLSVerify {
 			tr := &http.Transport{
@@ -100,25 +116,32 @@ func NewElasticsearch(log logrus.FieldLogger, c config.Elasticsearch, reporter A
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 			}
 			httpClient := &http.Client{Transport: tr}
-			elsClientParams = append(elsClientParams, elastic.SetHttpClient(httpClient))
+			elsOpts = append(elsOpts, elastic.SetHttpClient(httpClient))
 		}
-		// create elasticsearch client
-		elsClient, err = elastic.NewClient(elsClientParams...)
-		if err != nil {
-			return nil, fmt.Errorf("while creating new Elastic client: %w", err)
-		}
+	}
+
+	elsClient, err = elastic.NewClient(elsOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("while creating new Elastic client: %w", err)
+	}
+	pong, _, err := elsClient.Ping(c.Server).Do(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("while pinging cluster: %w", err)
 	}
 
 	esNotifier := &Elasticsearch{
-		log:      log,
-		reporter: reporter,
-		client:   elsClient,
-		indices:  c.Indices,
+		log:            log,
+		reporter:       reporter,
+		client:         elsClient,
+		indices:        c.Indices,
+		clusterVersion: pong.Version.Number,
+		status:         health.StatusUnknown,
+		failureReason:  "",
 	}
 
-	err = reporter.ReportSinkEnabled(esNotifier.IntegrationName())
+	err = reporter.ReportSinkEnabled(esNotifier.IntegrationName(), commGroupIdx)
 	if err != nil {
-		return nil, fmt.Errorf("while reporting analytics: %w", err)
+		log.Errorf("report analytics error: %s", err.Error())
 	}
 
 	return esNotifier, nil
@@ -156,13 +179,23 @@ func (e *Elasticsearch) flushIndex(ctx context.Context, indexCfg config.ELSIndex
 			},
 		}
 		_, err := e.client.CreateIndex(indexName).BodyJson(mapping).Do(ctx)
-		if err != nil {
+		if err != nil && elastic.ErrorReason(err) != elasticErrorReasonResourceAlreadyExists {
 			return fmt.Errorf("while creating index: %w", err)
 		}
 	}
 
 	// Send event to els
-	_, err = e.client.Index().Index(indexName).Type(indexCfg.Type).BodyJson(event).Do(ctx)
+	indexService := e.client.Index().Index(indexName)
+	majorVersion, err := esMajorClusterVersion(e.clusterVersion)
+	if err != nil {
+		return fmt.Errorf("while getting cluster major version: %w", err)
+	}
+	if majorVersion <= 7 && indexCfg.Type != "" {
+		// Only Elasticsearch <= 7.x supports Type parameter
+		// nolint:staticcheck
+		indexService.Type(indexCfg.Type)
+	}
+	_, err = indexService.BodyJson(event).Do(ctx)
 	if err != nil {
 		return fmt.Errorf("while posting data to ELS: %w", err)
 	}
@@ -174,36 +207,27 @@ func (e *Elasticsearch) flushIndex(ctx context.Context, indexCfg config.ELSIndex
 	return nil
 }
 
-// SendEvent sends event notification to Elasticsearch
-func (e *Elasticsearch) SendEvent(ctx context.Context, event event.Event, eventSources []string) (err error) {
-	e.log.Debugf(">> Sending to Elasticsearch: %+v", event)
+// SendEvent sends an event to a configured elasticsearch server.
+func (e *Elasticsearch) SendEvent(ctx context.Context, rawData any, sources []string) error {
+	e.log.Debugf(">> Sending to Elasticsearch: %+v", rawData)
 
 	errs := multierror.New()
 	for _, indexCfg := range e.indices {
-		if !sliceutil.Intersect(indexCfg.Bindings.Sources, eventSources) {
+		if !sliceutil.Intersect(indexCfg.Bindings.Sources, sources) {
 			continue
 		}
-
-		err := e.flushIndex(ctx, indexCfg, event)
+		err := e.flushIndex(ctx, indexCfg, rawData)
 		if err != nil {
+			e.setFailureReason(health.FailureReasonConnectionError, fmt.Sprintf("while sending event to Elasticsearch index %q: %s", indexCfg.Name, err.Error()))
 			errs = multierror.Append(errs, fmt.Errorf("while sending event to Elasticsearch index %q: %w", indexCfg.Name, err))
 			continue
 		}
 
+		e.setFailureReason("", "")
 		e.log.Debugf("Event successfully sent to Elasticsearch index %q", indexCfg.Name)
 	}
 
 	return errs.ErrorOrNil()
-}
-
-// SendMessageToAll is no-op.
-func (e *Elasticsearch) SendMessageToAll(_ context.Context, _ interactive.Message) error {
-	return nil
-}
-
-// SendGenericMessage is no-op.
-func (e *Elasticsearch) SendGenericMessage(_ context.Context, _ interactive.GenericMessage, _ []string) error {
-	return nil
 }
 
 // IntegrationName describes the notifier integration name.
@@ -214,4 +238,36 @@ func (e *Elasticsearch) IntegrationName() config.CommPlatformIntegration {
 // Type describes the notifier type.
 func (e *Elasticsearch) Type() config.IntegrationType {
 	return config.SinkIntegrationType
+}
+
+func (e *Elasticsearch) setFailureReason(reason health.FailureReasonMsg, errorMsg string) {
+	if reason == "" {
+		e.status = health.StatusHealthy
+	} else {
+		e.status = health.StatusUnHealthy
+	}
+	e.failureReason = reason
+	e.errorMsg = errorMsg
+}
+
+// GetStatus gets sink status
+func (e *Elasticsearch) GetStatus() health.PlatformStatus {
+	return health.PlatformStatus{
+		Status:   e.status,
+		Restarts: "0/0",
+		Reason:   e.failureReason,
+		ErrorMsg: e.errorMsg,
+	}
+}
+
+func esMajorClusterVersion(v string) (int, error) {
+	versionParts := strings.Split(v, ".")
+	if len(versionParts) == 1 {
+		return 0, errors.New("cluster version is not valid")
+	}
+	majorVersion, err := strconv.Atoi(versionParts[0])
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse cluster version: %s", versionParts[0])
+	}
+	return majorVersion, nil
 }

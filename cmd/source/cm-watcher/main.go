@@ -2,13 +2,12 @@ package main
 
 import (
 	"context"
+	_ "embed"
+	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 
-	"github.com/MakeNowJust/heredoc"
-	"github.com/hashicorp/go-plugin"
-	"gopkg.in/yaml.v3"
+	goplugin "github.com/hashicorp/go-plugin"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -21,10 +20,19 @@ import (
 
 	"github.com/kubeshop/botkube/pkg/api"
 	"github.com/kubeshop/botkube/pkg/api/source"
+	"github.com/kubeshop/botkube/pkg/plugin"
 )
 
-// version is set via ldflags by GoReleaser.
-var version = "dev"
+var (
+	// version is set via ldflags by GoReleaser.
+	version = "dev"
+
+	//go:embed config_schema.json
+	configJSONSchema string
+
+	//go:embed webhook_schema.json
+	incomingWebhookJSONSchema string
+)
 
 const (
 	pluginName  = "cm-watcher"
@@ -34,15 +42,23 @@ const (
 type (
 	// Config holds executor configuration.
 	Config struct {
-		ConfigMap Object `yaml:"configMap"`
+		ConfigMap Object `yaml:"configMap,omitempty"`
 	}
 	// Object holds information about object to watch.
 	Object struct {
-		Name      string          `yaml:"name"`
-		Namespace string          `yaml:"namespace"`
-		Event     watch.EventType `yaml:"event"`
+		Name      string          `yaml:"name,omitempty"`
+		Namespace string          `yaml:"namespace,omitempty"`
+		Event     watch.EventType `yaml:"event,omitempty"`
 	}
 )
+
+var defaultConfig = Config{
+	ConfigMap: Object{
+		Name:      "cm-watcher-trigger",
+		Namespace: "default",
+		Event:     "ADDED",
+	},
+}
 
 // CMWatcher implements Botkube source plugin.
 type CMWatcher struct{}
@@ -52,52 +68,62 @@ func (CMWatcher) Metadata(_ context.Context) (api.MetadataOutput, error) {
 	return api.MetadataOutput{
 		Version:     version,
 		Description: description,
-		JSONSchema:  jsonSchema(),
+		JSONSchema: api.JSONSchema{
+			Value: configJSONSchema,
+		},
+		ExternalRequest: api.ExternalRequestMetadata{
+			Payload: api.ExternalRequestPayload{
+				JSONSchema: api.JSONSchema{
+					Value: incomingWebhookJSONSchema,
+				},
+			},
+		},
 	}, nil
 }
 
 // Stream sends an event when a given ConfigMap is matched against the criteria defined in config.
 func (CMWatcher) Stream(ctx context.Context, in source.StreamInput) (source.StreamOutput, error) {
-	// default config
-	finalCfg := Config{
-		ConfigMap: Object{
-			Name:      "cm-watcher-trigger",
-			Namespace: "default",
-			Event:     "ADDED",
-		},
-	}
-
-	// In our case we don't have complex merge strategy,
-	// the last one that was specified wins :)
-	for _, inputCfg := range in.Configs {
-		var cfg Config
-		err := yaml.Unmarshal(inputCfg.RawYAML, &cfg)
-		if err != nil {
-			return source.StreamOutput{}, fmt.Errorf("while unmarshaling cm-watcher config: %w", err)
-		}
-
-		if cfg.ConfigMap.Name != "" {
-			finalCfg.ConfigMap.Name = cfg.ConfigMap.Name
-		}
-		if cfg.ConfigMap.Namespace != "" {
-			finalCfg.ConfigMap.Namespace = cfg.ConfigMap.Namespace
-		}
-		if cfg.ConfigMap.Event != "" {
-			finalCfg.ConfigMap.Event = cfg.ConfigMap.Event
-		}
+	var cfg Config
+	err := plugin.MergeSourceConfigsWithDefaults(defaultConfig, in.Configs, &cfg)
+	if err != nil {
+		return source.StreamOutput{}, fmt.Errorf("while merging input configuration: %w", err)
 	}
 
 	out := source.StreamOutput{
-		Output: make(chan []byte),
+		Event: make(chan source.Event),
 	}
 
-	go listenEvents(ctx, finalCfg.ConfigMap, out.Output)
+	go listenEvents(ctx, in.Context.KubeConfig, cfg.ConfigMap, out.Event)
 
 	return out, nil
 }
 
-func listenEvents(ctx context.Context, obj Object, sink chan<- []byte) {
-	config, err := clientcmd.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
+type payload struct {
+	Message string
+}
+
+// HandleExternalRequest handles incoming payload and returns an event based on it.
+func (CMWatcher) HandleExternalRequest(_ context.Context, in source.ExternalRequestInput) (source.ExternalRequestOutput, error) {
+	var p payload
+	err := json.Unmarshal(in.Payload, &p)
+	if err != nil {
+		return source.ExternalRequestOutput{}, fmt.Errorf("while unmarshaling payload: %w", err)
+	}
+
+	if p.Message == "" {
+		return source.ExternalRequestOutput{}, fmt.Errorf("message cannot be empty")
+	}
+
+	msg := fmt.Sprintf("*Incoming webhook event:* %s", p.Message)
+	return source.ExternalRequestOutput{
+		Event: source.Event{
+			Message: api.NewPlaintextMessage(msg, true),
+		},
+	}, nil
+}
+
+func listenEvents(ctx context.Context, kubeConfig []byte, obj Object, sink chan source.Event) {
+	config, err := clientcmd.RESTConfigFromKubeConfig(kubeConfig)
 	exitOnError(err)
 	clientset, err := kubernetes.NewForConfig(config)
 	exitOnError(err)
@@ -117,8 +143,15 @@ func listenEvents(ctx context.Context, obj Object, sink chan<- []byte) {
 	infiniteWatch := func(event watch.Event) (bool, error) {
 		if event.Type == obj.Event {
 			cm := event.Object.(*corev1.ConfigMap)
+
+			if cm.Annotations["die"] == "true" {
+				exitOnError(fmt.Errorf("die annotation set to true"))
+			}
+
 			msg := fmt.Sprintf("Plugin %s detected `%s` event on `%s/%s`", pluginName, obj.Event, cm.Namespace, cm.Name)
-			sink <- []byte(msg)
+			sink <- source.Event{
+				Message: api.NewPlaintextMessage(msg, true),
+			}
 		}
 
 		// always continue - context will cancel this watch for us :)
@@ -130,7 +163,7 @@ func listenEvents(ctx context.Context, obj Object, sink chan<- []byte) {
 }
 
 func main() {
-	source.Serve(map[string]plugin.Plugin{
+	source.Serve(map[string]goplugin.Plugin{
 		pluginName: &source.Plugin{
 			Source: &CMWatcher{},
 		},
@@ -140,18 +173,5 @@ func main() {
 func exitOnError(err error) {
 	if err != nil {
 		log.Fatal(err)
-	}
-}
-
-func jsonSchema() api.JSONSchema {
-	return api.JSONSchema{
-		Value: heredoc.Docf(`{
-			"$schema": "http://json-schema.org/draft-04/schema#",
-			"title": "botkube/cm-watcher",
-			"description": "%s",
-			"type": "object",
-			"properties": {},
-			"required": []
-		}`, description),
 	}
 }

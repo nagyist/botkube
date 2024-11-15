@@ -34,8 +34,6 @@ type NotifierHandler interface {
 
 	// SetNotificationsEnabled sets a new notification status for a given conversation ID.
 	SetNotificationsEnabled(conversationID string, enabled bool) error
-
-	BotName() string
 }
 
 var (
@@ -47,19 +45,22 @@ var (
 	}
 )
 
+// NotificationsStorage provides functionality to persist notifications config for a given channel.
+type NotificationsStorage interface {
+	PersistNotificationsEnabled(ctx context.Context, commGroupName string, platform config.CommPlatformIntegration, channelAlias string, enabled bool) error
+}
+
 // NotifierExecutor executes all commands that are related to notifications.
 type NotifierExecutor struct {
-	log               logrus.FieldLogger
-	analyticsReporter AnalyticsReporter
-	cfgManager        ConfigPersistenceManager
+	log        logrus.FieldLogger
+	cfgManager NotificationsStorage
 }
 
 // NewNotifierExecutor creates a new instance of NotifierExecutor
-func NewNotifierExecutor(log logrus.FieldLogger, analyticsReporter AnalyticsReporter, cfgManager ConfigPersistenceManager, cfg config.Config) *NotifierExecutor {
+func NewNotifierExecutor(log logrus.FieldLogger, cfgManager NotificationsStorage) *NotifierExecutor {
 	return &NotifierExecutor{
-		log:               log,
-		cfgManager:        cfgManager,
-		analyticsReporter: analyticsReporter,
+		log:        log,
+		cfgManager: cfgManager,
 	}
 }
 
@@ -69,19 +70,16 @@ func (e *NotifierExecutor) FeatureName() FeatureName {
 }
 
 // Commands returns slice of commands the executor supports
-func (e *NotifierExecutor) Commands() map[CommandVerb]CommandFn {
-	return map[CommandVerb]CommandFn{
-		CommandEnable:  e.Enable,
-		CommandDisable: e.Disable,
-		CommandStatus:  e.Status,
+func (e *NotifierExecutor) Commands() map[command.Verb]CommandFn {
+	return map[command.Verb]CommandFn{
+		command.EnableVerb:  e.Enable,
+		command.DisableVerb: e.Disable,
+		command.StatusVerb:  e.Status,
 	}
 }
 
 // Enable starts the notifier
-func (e *NotifierExecutor) Enable(ctx context.Context, cmdCtx CommandContext) (interactive.Message, error) {
-	cmdVerb, cmdRes := parseCmdVerb(cmdCtx.Args)
-	defer e.reportCommand(cmdVerb, cmdRes, cmdCtx.Conversation.CommandOrigin, cmdCtx.Platform)
-
+func (e *NotifierExecutor) Enable(ctx context.Context, cmdCtx CommandContext) (interactive.CoreMessage, error) {
 	const enabled = true
 	err := cmdCtx.NotifierHandler.SetNotificationsEnabled(cmdCtx.Conversation.ID, enabled)
 	if err != nil {
@@ -89,7 +87,7 @@ func (e *NotifierExecutor) Enable(ctx context.Context, cmdCtx CommandContext) (i
 			msg := fmt.Sprintf(notifierNotConfiguredMsgFmt, cmdCtx.Conversation.ID, cmdCtx.ClusterName)
 			return respond(msg, cmdCtx), nil
 		}
-		return interactive.Message{}, fmt.Errorf("while setting notifications to %t: %w", enabled, err)
+		return interactive.CoreMessage{}, fmt.Errorf("while setting notifications to %t: %w", enabled, err)
 	}
 	successMessage := fmt.Sprintf(notifierStartMsgFmt, cmdCtx.ClusterName)
 	err = e.cfgManager.PersistNotificationsEnabled(ctx, cmdCtx.CommGroupName, cmdCtx.Platform, cmdCtx.Conversation.Alias, enabled)
@@ -98,16 +96,13 @@ func (e *NotifierExecutor) Enable(ctx context.Context, cmdCtx CommandContext) (i
 			e.log.Warnf(notifierPersistenceNotSupportedFmt, cmdCtx.Platform)
 			return respond(successMessage, cmdCtx), nil
 		}
-		return interactive.Message{}, fmt.Errorf("while persisting configuration: %w", err)
+		return interactive.CoreMessage{}, fmt.Errorf("while persisting configuration: %w", err)
 	}
 	return respond(successMessage, cmdCtx), nil
 }
 
 // Disable stops the notifier
-func (e *NotifierExecutor) Disable(ctx context.Context, cmdCtx CommandContext) (interactive.Message, error) {
-	cmdVerb, cmdRes := parseCmdVerb(cmdCtx.Args)
-	defer e.reportCommand(cmdVerb, cmdRes, cmdCtx.Conversation.CommandOrigin, cmdCtx.Platform)
-
+func (e *NotifierExecutor) Disable(ctx context.Context, cmdCtx CommandContext) (interactive.CoreMessage, error) {
 	const enabled = false
 	err := cmdCtx.NotifierHandler.SetNotificationsEnabled(cmdCtx.Conversation.ID, enabled)
 	if err != nil {
@@ -115,7 +110,7 @@ func (e *NotifierExecutor) Disable(ctx context.Context, cmdCtx CommandContext) (
 			msg := fmt.Sprintf(notifierNotConfiguredMsgFmt, cmdCtx.Conversation.ID, cmdCtx.ClusterName)
 			return respond(msg, cmdCtx), nil
 		}
-		return interactive.Message{}, fmt.Errorf("while setting notifications to %t: %w", enabled, err)
+		return interactive.CoreMessage{}, fmt.Errorf("while setting notifications to %t: %w", enabled, err)
 	}
 	successMessage := fmt.Sprintf(notifierStopMsgFmt, cmdCtx.ClusterName)
 	err = e.cfgManager.PersistNotificationsEnabled(ctx, cmdCtx.CommGroupName, cmdCtx.Platform, cmdCtx.Conversation.Alias, enabled)
@@ -124,33 +119,20 @@ func (e *NotifierExecutor) Disable(ctx context.Context, cmdCtx CommandContext) (
 			e.log.Warnf(notifierPersistenceNotSupportedFmt, cmdCtx.Platform)
 			return respond(successMessage, cmdCtx), nil
 		}
-		return interactive.Message{}, fmt.Errorf("while persisting configuration: %w", err)
+		return interactive.CoreMessage{}, fmt.Errorf("while persisting configuration: %w", err)
 	}
 	return respond(successMessage, cmdCtx), nil
 }
 
 // Status returns the status of a notifier (per channel)
-func (e *NotifierExecutor) Status(ctx context.Context, cmdCtx CommandContext) (interactive.Message, error) {
+func (e *NotifierExecutor) Status(ctx context.Context, cmdCtx CommandContext) (interactive.CoreMessage, error) {
 	cmdVerb, cmdRes := parseCmdVerb(cmdCtx.Args)
-	defer e.reportCommand(cmdVerb, cmdRes, cmdCtx.Conversation.CommandOrigin, cmdCtx.Platform)
-
 	enabled := cmdCtx.NotifierHandler.NotificationsEnabled(cmdCtx.Conversation.ID)
 	enabledStr := notifierStatusStrings[enabled]
 	msg := fmt.Sprintf(notifierStatusMsgFmt, cmdCtx.ClusterName, enabledStr)
 	if cmdRes == "" {
-		helpMsg := cmdCtx.Mapping.HelpMessageForVerb(CommandVerb(cmdVerb), cmdCtx.BotName)
+		helpMsg := cmdCtx.Mapping.HelpMessageForVerb(command.Verb(cmdVerb))
 		msg = fmt.Sprintf("%s\n\n%s\n", msg, helpMsg)
 	}
 	return respond(msg, cmdCtx), nil
-}
-
-func (e *NotifierExecutor) reportCommand(cmdVerb, cmdRes string, commandOrigin command.Origin, platform config.CommPlatformIntegration) {
-	cmdToReport := cmdVerb
-	if cmdRes != "" {
-		cmdToReport = fmt.Sprintf("%s %s", cmdVerb, cmdRes)
-	}
-	err := e.analyticsReporter.ReportCommand(platform, cmdToReport, commandOrigin, false)
-	if err != nil {
-		e.log.Errorf("while reporting notification command: %s", err.Error())
-	}
 }

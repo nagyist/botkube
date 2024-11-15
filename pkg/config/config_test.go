@@ -6,13 +6,11 @@ import (
 	"testing"
 
 	"github.com/MakeNowJust/heredoc"
-	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 	"gotest.tools/v3/golden"
 
-	intConfig "github.com/kubeshop/botkube/internal/config"
 	"github.com/kubeshop/botkube/pkg/config"
 )
 
@@ -30,7 +28,7 @@ func TestLoadConfigSuccess(t *testing.T) {
 	t.Setenv("BOTKUBE_PLUGINS_REPOSITORIES_BOTKUBE_URL", "http://localhost:3000/botkube.yaml")
 
 	// when
-	files := intConfig.YAMLFiles{
+	files := config.YAMLFiles{
 		readTestdataFile(t, "config-all.yaml"),
 		readTestdataFile(t, "config-global.yaml"),
 		readTestdataFile(t, "config-slack-override.yaml"),
@@ -49,94 +47,6 @@ func TestLoadConfigSuccess(t *testing.T) {
 	require.NoError(t, err)
 
 	golden.Assert(t, string(gotData), filepath.Join(t.Name(), "config.golden.yaml"))
-}
-
-func TestLoadConfigWithPlugins(t *testing.T) {
-	// given
-	expSourcePlugin := config.PluginsExecutors{
-		"botkube/keptn": {
-			Enabled: true,
-			Config: map[string]interface{}{
-				"field": "value",
-			},
-		},
-	}
-
-	expExecutorPlugin := config.PluginsExecutors{
-		"botkube/echo": {
-			Enabled: true,
-			Config: map[string]interface{}{
-				"changeResponseToUpperCase": true,
-			},
-		},
-	}
-
-	files := intConfig.YAMLFiles{
-		readTestdataFile(t, "config-all.yaml"),
-	}
-
-	// when
-	gotCfg, _, err := config.LoadWithDefaults(files)
-
-	//then
-	require.NoError(t, err)
-	require.NotNil(t, gotCfg)
-
-	assert.Equal(t, expSourcePlugin, gotCfg.Sources["k8s-events"].Plugins)
-	assert.Equal(t, expExecutorPlugin, gotCfg.Executors["plugin-based"].Plugins)
-}
-
-func TestFromProvider(t *testing.T) {
-	t.Run("from envs variable only", func(t *testing.T) {
-		// given
-		t.Setenv("BOTKUBE_CONFIG_PATHS", "testdata/TestFromProvider/first.yaml,testdata/TestFromProvider/second.yaml,testdata/TestFromProvider/third.yaml")
-
-		// when
-		gotConfigs, err := config.FromProvider(nil)
-		assert.NoError(t, err)
-
-		// then
-		c, err := os.ReadFile("testdata/TestFromProvider/all.yaml")
-		assert.NoError(t, err)
-		assert.Equal(t, c, gotConfigs.Merge())
-	})
-
-	t.Run("from CLI flag only", func(t *testing.T) {
-		// given
-		fSet := pflag.NewFlagSet("testing", pflag.ContinueOnError)
-		config.RegisterFlags(fSet)
-		err := fSet.Parse([]string{"--config=testdata/TestFromProvider/first.yaml,testdata/TestFromProvider/second.yaml", "--config", "testdata/TestFromProvider/third.yaml"})
-		require.NoError(t, err)
-
-		// when
-		gotConfigs, err := config.FromProvider(nil)
-		assert.NoError(t, err)
-
-		// then
-		c, err := os.ReadFile("testdata/TestFromProvider/all.yaml")
-		assert.NoError(t, err)
-		assert.Equal(t, c, gotConfigs.Merge())
-	})
-
-	t.Run("should honor env variable over the CLI flag", func(t *testing.T) {
-		// given
-		fSet := pflag.NewFlagSet("testing", pflag.ContinueOnError)
-		config.RegisterFlags(fSet)
-
-		err := fSet.Parse([]string{"--config=testdata/TestFromProvider/from-cli-flag.yaml,testdata/TestFromProvider/from-cli-flag-second.yaml"})
-		require.NoError(t, err)
-
-		t.Setenv("BOTKUBE_CONFIG_PATHS", "testdata/TestFromProvider/first.yaml,testdata/TestFromProvider/second.yaml,testdata/TestFromProvider/third.yaml")
-
-		// when
-		gotConfigs, err := config.FromProvider(nil)
-		assert.NoError(t, err)
-
-		// then
-		c, err := os.ReadFile("testdata/TestFromProvider/all.yaml")
-		assert.NoError(t, err)
-		assert.Equal(t, c, gotConfigs.Merge())
-	})
 }
 
 func TestNormalizeConfigEnvName(t *testing.T) {
@@ -194,6 +104,7 @@ func TestLoadedConfigValidationErrors(t *testing.T) {
 		name      string
 		expErrMsg string
 		configs   [][]byte
+		isWarning bool
 	}{
 		{
 			name: "no config files",
@@ -234,8 +145,7 @@ func TestLoadedConfigValidationErrors(t *testing.T) {
 		{
 			name: "no tokens",
 			expErrMsg: heredoc.Doc(`
-				found critical validation errors: 5 errors occurred:
-					* Key: 'Config.Communications[default-workspace].Slack.Token' Token is a required field
+				found critical validation errors: 4 errors occurred:
 					* Key: 'Config.Communications[default-workspace].SocketSlack.AppToken' AppToken is a required field
 					* Key: 'Config.Communications[default-workspace].SocketSlack.BotToken' BotToken is a required field
 					* Key: 'Config.Communications[default-workspace].SocketSlack.BotToken' BotToken must have the xoxb- prefix. Learn more at https://docs.botkube.io/installation/socketslack/#obtain-bot-token
@@ -272,36 +182,54 @@ func TestLoadedConfigValidationErrors(t *testing.T) {
 				readTestdataFile(t, "missing-action-bindings.yaml"),
 			},
 		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			// when
-			cfg, details, err := config.LoadWithDefaults(tc.configs)
-
-			// then
-			assert.Nil(t, cfg)
-			assert.NoError(t, details.ValidateWarnings)
-			assert.EqualError(t, err, tc.expErrMsg)
-		})
-	}
-}
-
-func TestLoadedConfigValidationWarnings(t *testing.T) {
-	// given
-	tests := []struct {
-		name       string
-		expWarnMsg string
-		configs    [][]byte
-	}{
 		{
-			name: "executor specifies all and exact namespace in include property",
-			expWarnMsg: heredoc.Doc(`
-				2 errors occurred:
-					* Key: 'Config.Sources[k8s-events].Kubernetes.Resources[0].Namespaces.Include' Include matches both all and exact namespaces
-					* Key: 'Config.Executors[kubectl-read-only].Kubectl.Namespaces.Include' Include matches both all and exact namespaces`),
+			name: "missing alias command",
+			expErrMsg: heredoc.Doc(`
+				found critical validation errors: 1 error occurred:
+					* Key: 'Config.Aliases[eee].Command' Command is a required field`),
 			configs: [][]byte{
-				readTestdataFile(t, "executors-include-warning.yaml"),
+				readTestdataFile(t, "missing-alias-command.yaml"),
 			},
+		},
+		{
+			name: "invalid alias command",
+			expErrMsg: heredoc.Doc(`
+				found critical validation errors: 1 error occurred:
+					* Key: 'Config.Aliases[foo].Command' Command prefix 'foo' not found in executors or builtin commands`),
+			configs: [][]byte{
+				readTestdataFile(t, "invalid-alias-command.yaml"),
+			},
+		},
+		{
+			name: "RBAC helm executors are different",
+			expErrMsg: heredoc.Doc(`
+				found critical validation errors: 1 error occurred:
+					* Key: 'Config.Communications[default-group].SocketSlack.Channels[botkube].Bindings.helm-1' Binding is referencing plugins of same kind with different RBAC. 'helm-1' and 'helm-2' bindings must be identical when used together.`),
+			configs: [][]byte{
+				readTestdataFile(t, "executors-rbac.yaml"),
+			},
+		},
+		{
+			name: "RBAC cm sources are different",
+			expErrMsg: heredoc.Doc(`
+				found critical validation errors: 1 error occurred:
+					* Key: 'Config.Communications[default-group].SocketSlack.Channels[botkube].Bindings.cm-1' Binding is referencing plugins of same kind with different RBAC. 'cm-1' and 'cm-2' bindings must be identical when used together.`),
+			configs: [][]byte{
+				readTestdataFile(t, "sources-rbac.yaml"),
+			},
+		},
+		{
+			name: "Invalid channel names",
+			expErrMsg: heredoc.Doc(`
+				4 errors occurred:
+					* Key: 'Config.Communications[default-workspace].SocketSlack.alias2.Name' The channel name 'INCORRECT' seems to be invalid. See the documentation to learn more: https://api.slack.com/methods/conversations.rename#naming.
+					* Key: 'Config.Communications[default-workspace].CloudSlack.alias2.Name' The channel name 'INCORRECT' seems to be invalid. See the documentation to learn more: https://api.slack.com/methods/conversations.rename#naming.
+					* Key: 'Config.Communications[default-workspace].Mattermost.alias.Name' The channel name 'too-long name really really really really really really really really really really really really long' seems to be invalid. See the documentation to learn more: https://docs.mattermost.com/channels/channel-naming-conventions.html.
+					* Key: 'Config.Communications[default-workspace].Discord.alias2.ID' The channel name 'incorrect' seems to be invalid. See the documentation to learn more: https://support.discord.com/hc/en-us/articles/206346498-Where-can-I-find-my-User-Server-Message-ID-.`),
+			configs: [][]byte{
+				readTestdataFile(t, "invalid-channels.yaml"),
+			},
+			isWarning: true,
 		},
 	}
 	for _, tc := range tests {
@@ -310,9 +238,17 @@ func TestLoadedConfigValidationWarnings(t *testing.T) {
 			cfg, details, err := config.LoadWithDefaults(tc.configs)
 
 			// then
-			assert.NotNil(t, cfg)
-			assert.NoError(t, err)
-			assert.EqualError(t, details.ValidateWarnings, tc.expWarnMsg)
+			if tc.isWarning {
+				assert.NoError(t, err)
+				assert.NotNil(t, cfg)
+				assert.Error(t, details.ValidateWarnings)
+				assert.EqualError(t, details.ValidateWarnings, tc.expErrMsg)
+				return
+			}
+
+			assert.Nil(t, cfg)
+			assert.NoError(t, details.ValidateWarnings)
+			assert.EqualError(t, err, tc.expErrMsg)
 		})
 	}
 }
@@ -419,50 +355,79 @@ func readTestdataFile(t *testing.T, name string) []byte {
 	return out
 }
 
-func TestIsNamespaceAllowed(t *testing.T) {
+func TestRegexConstraints_IsAllowed(t *testing.T) {
 	tests := map[string]struct {
-		nsConfig  config.Namespaces
-		givenNs   string
-		isAllowed bool
+		nsConfig           config.RegexConstraints
+		givenNs            string
+		isAllowed          bool
+		expectedErrMessage string
 	}{
-		"should watch all except ignored ones": {
-			nsConfig:  config.Namespaces{Include: []string{".*"}, Exclude: []string{"demo", "abc"}},
+		"should match all except ignored ones": {
+			nsConfig:  config.RegexConstraints{Include: []string{".*"}, Exclude: []string{"demo", "abc"}},
 			givenNs:   "demo",
 			isAllowed: false,
 		},
-		"should watch all when ignore has empty items only": {
-			nsConfig:  config.Namespaces{Include: []string{".*"}, Exclude: []string{""}},
+		"should match all when ignore has empty items only": {
+			nsConfig:  config.RegexConstraints{Include: []string{".*"}, Exclude: []string{""}},
 			givenNs:   "demo",
 			isAllowed: true,
 		},
-		"should watch all when ignore is a nil slice": {
-			nsConfig:  config.Namespaces{Include: []string{".*"}, Exclude: nil},
+		"should match all when ignore is a nil slice": {
+			nsConfig:  config.RegexConstraints{Include: []string{".*"}, Exclude: nil},
 			givenNs:   "demo",
 			isAllowed: true,
 		},
 		"should ignore matched by regex": {
-			nsConfig:  config.Namespaces{Include: []string{".*"}, Exclude: []string{"my-.*"}},
+			nsConfig:  config.RegexConstraints{Include: []string{".*"}, Exclude: []string{"my-.*"}},
 			givenNs:   "my-ns",
 			isAllowed: false,
 		},
 		"should ignore matched by regexp even if exact name is mentioned too": {
-			nsConfig:  config.Namespaces{Include: []string{".*"}, Exclude: []string{"demo", "ignored-.*-ns"}},
+			nsConfig:  config.RegexConstraints{Include: []string{".*"}, Exclude: []string{"demo", "ignored-.*-ns"}},
 			givenNs:   "ignored-42-ns",
 			isAllowed: false,
 		},
-		"should watch all if regexp is not matching given namespace": {
-			nsConfig:  config.Namespaces{Include: []string{".*"}, Exclude: []string{"demo-.*"}},
+		"should match all if regexp is not matching given namespace": {
+			nsConfig:  config.RegexConstraints{Include: []string{".*"}, Exclude: []string{"demo-.*"}},
 			givenNs:   "demo",
 			isAllowed: true,
+		},
+		"should match empty value": {
+			nsConfig:  config.RegexConstraints{Include: []string{".*"}, Exclude: []string{"demo-.*"}},
+			givenNs:   "",
+			isAllowed: true,
+		},
+		"should match only empty value": {
+			nsConfig:  config.RegexConstraints{Include: []string{"^$"}, Exclude: []string{}},
+			givenNs:   "",
+			isAllowed: true,
+		},
+		"invalid exclude regex": {
+			nsConfig:           config.RegexConstraints{Include: []string{".*"}, Exclude: []string{"["}},
+			givenNs:            "demo",
+			isAllowed:          false,
+			expectedErrMessage: "while matching \"demo\" with exclude regex \"[\": error parsing regexp: missing closing ]: `[`",
+		},
+		"invalid include regex": {
+			nsConfig:           config.RegexConstraints{Include: []string{"["}, Exclude: []string{}},
+			givenNs:            "demo",
+			isAllowed:          false,
+			expectedErrMessage: "while matching \"demo\" with include regex \"[\": error parsing regexp: missing closing ]: `[`",
 		},
 	}
 	for name, test := range tests {
 		name, test := name, test
 		t.Run(name, func(t *testing.T) {
-			actual := test.nsConfig.IsAllowed(test.givenNs)
-			if actual != test.isAllowed {
-				t.Errorf("expected: %v != actual: %v\n", test.isAllowed, actual)
+			actual, err := test.nsConfig.IsAllowed(test.givenNs)
+
+			if test.expectedErrMessage != "" {
+				require.False(t, actual)
+				require.EqualError(t, err, test.expectedErrMessage)
+				return
 			}
+
+			require.NoError(t, err)
+			assert.Equal(t, test.isAllowed, actual)
 		})
 	}
 }

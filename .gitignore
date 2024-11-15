@@ -33,14 +33,20 @@ tags
 /analytics.yaml
 /resource_config.yaml
 /comm_config.yaml
+/local_config.yaml
 
 /bin
 
 ./botkube
+./botkube-agent
 ./botkube-test
+./main
 
 # Release
 dist/
 plugin-dist/
+plugins-dev-index.yaml
 plugins-index.yaml
 CHANGELOG.md
+botkube-agent
+.goreleaser_temp.yaml

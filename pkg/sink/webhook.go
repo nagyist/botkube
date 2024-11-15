@@ -6,16 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/kubeshop/botkube/pkg/bot/interactive"
+	"github.com/kubeshop/botkube/internal/health"
 	"github.com/kubeshop/botkube/pkg/config"
-	"github.com/kubeshop/botkube/pkg/event"
-	"github.com/kubeshop/botkube/pkg/format"
 	"github.com/kubeshop/botkube/pkg/multierror"
-	"github.com/kubeshop/botkube/pkg/sliceutil"
 )
 
 const defaultHTTPCliTimeout = 30 * time.Second
@@ -25,97 +23,54 @@ type Webhook struct {
 	log      logrus.FieldLogger
 	reporter AnalyticsReporter
 
-	URL      string
-	Bindings config.SinkBindings
+	URL           string
+	Bindings      config.SinkBindings
+	status        health.PlatformStatusMsg
+	failureReason health.FailureReasonMsg
+	errorMsg      string
 }
 
 // WebhookPayload contains json payload to be sent to webhook url
 type WebhookPayload struct {
-	EventMeta       EventMeta   `json:"meta"`
-	EventStatus     EventStatus `json:"status"`
-	EventSummary    string      `json:"summary"`
-	TimeStamp       time.Time   `json:"timestamp"`
-	Recommendations []string    `json:"recommendations,omitempty"`
-	Warnings        []string    `json:"warnings,omitempty"`
-}
-
-// EventMeta contains the metadata about the event occurred
-type EventMeta struct {
-	Kind      string `json:"kind"`
-	Name      string `json:"name"`
-	Namespace string `json:"namespace"`
-	Cluster   string `json:"cluster,omitempty"`
-}
-
-// EventStatus contains the status about the event occurred
-type EventStatus struct {
-	Type     config.EventType `json:"type"`
-	Level    config.Level     `json:"level"`
-	Reason   string           `json:"reason,omitempty"`
-	Error    string           `json:"error,omitempty"`
-	Messages []string         `json:"messages,omitempty"`
+	Source    string    `json:"source,omitempty"`
+	Data      any       `json:"data,omitempty"`
+	TimeStamp time.Time `json:"timeStamp"`
 }
 
 // NewWebhook creates a new Webhook instance.
-func NewWebhook(log logrus.FieldLogger, c config.Webhook, reporter AnalyticsReporter) (*Webhook, error) {
+func NewWebhook(log logrus.FieldLogger, commGroupIdx int, c config.Webhook, reporter AnalyticsReporter) (*Webhook, error) {
 	whNotifier := &Webhook{
-		log:      log,
-		reporter: reporter,
-		URL:      c.URL,
-		Bindings: c.Bindings,
+		log:           log,
+		reporter:      reporter,
+		URL:           c.URL,
+		Bindings:      c.Bindings,
+		status:        health.StatusUnknown,
+		failureReason: "",
 	}
 
-	err := reporter.ReportSinkEnabled(whNotifier.IntegrationName())
+	err := reporter.ReportSinkEnabled(whNotifier.IntegrationName(), commGroupIdx)
 	if err != nil {
-		return nil, fmt.Errorf("while reporting analytics: %w", err)
+		log.Errorf("report analytics error: %s", err.Error())
 	}
 
 	return whNotifier, nil
 }
 
-// SendEvent sends event notification to Webhook url
-func (w *Webhook) SendEvent(ctx context.Context, event event.Event, eventSources []string) (err error) {
-	if !sliceutil.Intersect(w.Bindings.Sources, eventSources) {
-		w.log.Debugf("Event sources do not match Webhook sources, event: %+v, eventSources: %+v", event, eventSources)
-		return nil
-	}
-
+// SendEvent sends an event to a configured server.
+func (w *Webhook) SendEvent(ctx context.Context, rawData any, sources []string) error {
 	jsonPayload := &WebhookPayload{
-		EventMeta: EventMeta{
-			Kind:      event.Kind,
-			Name:      event.Name,
-			Namespace: event.Namespace,
-			Cluster:   event.Cluster,
-		},
-		EventStatus: EventStatus{
-			Type:     event.Type,
-			Level:    event.Level,
-			Reason:   event.Reason,
-			Error:    event.Error,
-			Messages: event.Messages,
-		},
-		EventSummary:    format.ShortMessage(event),
-		TimeStamp:       event.TimeStamp,
-		Recommendations: event.Recommendations,
-		Warnings:        event.Warnings,
+		Source: strings.Join(sources, ","),
+		Data:   rawData,
 	}
 
-	err = w.PostWebhook(ctx, jsonPayload)
+	err := w.PostWebhook(ctx, jsonPayload)
 	if err != nil {
-		return fmt.Errorf("while sending event to webhook: %w", err)
+		w.setFailureReason(health.FailureReasonConnectionError, fmt.Sprintf("while sending message to webhook: %s", err.Error()))
+		return fmt.Errorf("while sending message to webhook: %w", err)
 	}
 
-	w.log.Debugf("Event successfully sent to Webhook: %+v", event)
-	return nil
-}
-
-// SendMessageToAll is no-op.
-func (w *Webhook) SendMessageToAll(_ context.Context, _ interactive.Message) error {
-	return nil
-}
-
-// SendGenericMessage is no-op.
-func (w *Webhook) SendGenericMessage(_ context.Context, _ interactive.GenericMessage, _ []string) error {
+	w.setFailureReason("", "")
+	w.log.Debugf("Message successfully sent to Webhook: %+v", rawData)
 	return nil
 }
 
@@ -159,4 +114,24 @@ func (w *Webhook) IntegrationName() config.CommPlatformIntegration {
 // Type describes the notifier type.
 func (w *Webhook) Type() config.IntegrationType {
 	return config.SinkIntegrationType
+}
+
+func (w *Webhook) setFailureReason(reason health.FailureReasonMsg, errorMsg string) {
+	if reason == "" {
+		w.status = health.StatusHealthy
+	} else {
+		w.status = health.StatusUnHealthy
+	}
+	w.failureReason = reason
+	w.errorMsg = errorMsg
+}
+
+// GetStatus gets sink status
+func (w *Webhook) GetStatus() health.PlatformStatus {
+	return health.PlatformStatus{
+		Status:   w.status,
+		Restarts: "0/0",
+		Reason:   w.failureReason,
+		ErrorMsg: w.errorMsg,
+	}
 }

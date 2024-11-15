@@ -8,8 +8,8 @@ import (
 
 	"github.com/go-playground/validator/v10"
 
-	"github.com/kubeshop/botkube/internal/stringx"
 	"github.com/kubeshop/botkube/pkg/multierror"
+	"github.com/kubeshop/botkube/pkg/stringx"
 )
 
 // DecomposePluginKey extract details from plugin key.
@@ -28,6 +28,19 @@ func DecomposePluginKey(key string) (string, string, string, error) {
 	return repo, name, ver, nil
 }
 
+// ExecutorNameForKey returns executor name for a given executor configuration key. It might be a plugin or a built-in executor.
+func ExecutorNameForKey(key string) string {
+	prefix, name, found := strings.Cut(key, "/")
+	if !found {
+		// Assume this is a built-in executor
+		// TODO: Refacator this once we migrate all built-in executors to plugins
+		return prefix
+	}
+
+	name, _, _ = strings.Cut(name, "@")
+	return name
+}
+
 func validatePluginProperties(repo, plugin string) error {
 	issues := multierror.New()
 	if repo == "" {
@@ -44,11 +57,11 @@ type validatePluginEntry struct {
 	Version string
 }
 
-// validateBindPlugins validates that only unique plugins are on the bind list.
+// validateBoundPlugins validates that only unique plugins are on the bind list.
 //
 // NOTE: We use a strict matching. We don't support `botkube/kubectl` and botkube/kubectl@v1.1.0 even thought it may resolve to the same version
 // because if version is not specified then we use the latest one found in a given repository which may be v1.1.0.
-func validateBindPlugins(sl validator.StructLevel, enabledPluginsViaBindings []string) {
+func validateBoundPlugins(sl validator.StructLevel, enabledPluginsViaBindings []string) {
 	indexedByName := map[string]validatePluginEntry{}
 
 	for _, key := range enabledPluginsViaBindings {
@@ -86,7 +99,7 @@ func validateBindPlugins(sl validator.StructLevel, enabledPluginsViaBindings []s
 	}
 }
 
-func validatePlugins(sl validator.StructLevel, pluginConfigs PluginsExecutors) {
+func validatePlugins(sl validator.StructLevel, pluginConfigs Plugins) {
 	var enabledPluginsViaBindings []string
 	for pluginKey, plugin := range pluginConfigs {
 		if !plugin.Enabled {

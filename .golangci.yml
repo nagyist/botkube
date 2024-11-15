@@ -7,10 +7,14 @@ issues:
     - Error return value of .((os\.)?std(out|err)\..*|.*Close|.*Flush|os\.Remove(All)?|.*print(f|ln)?|os\.(Un)?Setenv). is not checked
     # EXC0008 gosec: Duplicated errcheck checks
     - (G104|G307)
+    # G505: Blocklisted import crypto/sha1: weak cryptographic primitive
+    # This is used just for hashing in ArgoCD plugin
+    - G505
 run:
   tests: true
   build-tags:
     - integration
+    - migration
   skip-files:
     - ".*\\.generated\\.go$"
 linters:
@@ -43,7 +47,8 @@ linters-settings:
   local-prefixes: github.com/kubeshop/botkube
   gocyclo:
     # https://github.com/kubeshop/botkube/issues/745
-    min-complexity: 40
+    # Merging slack and discord test cases increased cyclo due to if conditions
+    min-complexity: 55
   revive:
     rules:
       # Disable warns about capitalized and ended with punctuation error messages

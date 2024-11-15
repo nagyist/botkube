@@ -21,19 +21,16 @@ var (
 
 // ConfigExecutor executes all commands that are related to config
 type ConfigExecutor struct {
-	log               logrus.FieldLogger
-	analyticsReporter AnalyticsReporter
-
+	log logrus.FieldLogger
 	// Used for deprecated showControllerConfig function.
 	cfg config.Config
 }
 
 // NewConfigExecutor returns a new ConfigExecutor instance
-func NewConfigExecutor(log logrus.FieldLogger, analyticsReporter AnalyticsReporter, config config.Config) *ConfigExecutor {
+func NewConfigExecutor(log logrus.FieldLogger, config config.Config) *ConfigExecutor {
 	return &ConfigExecutor{
-		log:               log,
-		analyticsReporter: analyticsReporter,
-		cfg:               config,
+		log: log,
+		cfg: config,
 	}
 }
 
@@ -43,56 +40,22 @@ func (e *ConfigExecutor) FeatureName() FeatureName {
 }
 
 // Commands returns slice of commands the executor supports
-func (e *ConfigExecutor) Commands() map[CommandVerb]CommandFn {
-	return map[CommandVerb]CommandFn{
-		CommandShow: e.Show,
+func (e *ConfigExecutor) Commands() map[command.Verb]CommandFn {
+	return map[command.Verb]CommandFn{
+		command.ShowVerb: e.Show,
 	}
 }
 
 // Show returns Config in yaml format
-func (e *ConfigExecutor) Show(ctx context.Context, cmdCtx CommandContext) (interactive.Message, error) {
-	cmdVerb, cmdRes := parseCmdVerb(cmdCtx.Args)
-	defer e.reportCommand(cmdVerb, cmdRes, cmdCtx.Conversation.CommandOrigin, cmdCtx.Platform)
-
-	cfg, err := e.renderBotkubeConfiguration()
+func (e *ConfigExecutor) Show(_ context.Context, cmdCtx CommandContext) (interactive.CoreMessage, error) {
+	redactedCfg := config.HideSensitiveInfo(e.cfg)
+	bytes, err := yaml.Marshal(redactedCfg)
 	if err != nil {
-		return interactive.Message{}, fmt.Errorf("while rendering Botkube configuration: %w", err)
+		return interactive.CoreMessage{}, fmt.Errorf("while rendering Botkube configuration: %w", err)
 	}
-	return respond(cfg, cmdCtx), nil
-}
 
-func (e *ConfigExecutor) reportCommand(cmdVerb, cmdRes string, commandOrigin command.Origin, platform config.CommPlatformIntegration) {
-	cmdToReport := fmt.Sprintf("%s %s", cmdVerb, cmdRes)
-	err := e.analyticsReporter.ReportCommand(platform, cmdToReport, commandOrigin, false)
 	if err != nil {
-		e.log.Errorf("while reporting config command: %s", err.Error())
+		return interactive.CoreMessage{}, fmt.Errorf("while rendering Botkube configuration: %w", err)
 	}
-}
-
-const redactedSecretStr = "*** REDACTED ***"
-
-func (e *ConfigExecutor) renderBotkubeConfiguration() (string, error) {
-	cfg := e.cfg
-
-	// hide sensitive info
-	// TODO: avoid printing sensitive data without need to resetting them manually (which is an error-prone approach)
-	for key, old := range cfg.Communications {
-		old.Slack.Token = redactedSecretStr
-		old.SocketSlack.AppToken = redactedSecretStr
-		old.SocketSlack.BotToken = redactedSecretStr
-		old.Elasticsearch.Password = redactedSecretStr
-		old.Discord.Token = redactedSecretStr
-		old.Mattermost.Token = redactedSecretStr
-		old.Teams.AppPassword = redactedSecretStr
-
-		// maps are not addressable: https://stackoverflow.com/questions/42605337/cannot-assign-to-struct-field-in-a-map
-		cfg.Communications[key] = old
-	}
-
-	b, err := yaml.Marshal(cfg)
-	if err != nil {
-		return "", err
-	}
-
-	return string(b), nil
+	return respond(string(bytes), cmdCtx), nil
 }

@@ -14,8 +14,10 @@ import (
 	"golang.org/x/text/runes"
 	"golang.org/x/text/transform"
 
+	"github.com/kubeshop/botkube/pkg/api"
 	"github.com/kubeshop/botkube/pkg/bot/interactive"
 	"github.com/kubeshop/botkube/pkg/config"
+	"github.com/kubeshop/botkube/pkg/execute/command"
 )
 
 const (
@@ -27,7 +29,7 @@ const (
 var (
 	sourceBindingFeatureName = FeatureName{
 		Name:    "sourcebinding",
-		Aliases: []string{"sourcebindings"},
+		Aliases: []string{"sourcebindings", "sb"},
 	}
 )
 
@@ -37,10 +39,10 @@ func (e *SourceBindingExecutor) FeatureName() FeatureName {
 }
 
 // Commands returns slice of commands the executor supports
-func (e *SourceBindingExecutor) Commands() map[CommandVerb]CommandFn {
-	return map[CommandVerb]CommandFn{
-		CommandEdit:   e.Edit,
-		CommandStatus: e.Status,
+func (e *SourceBindingExecutor) Commands() map[command.Verb]CommandFn {
+	return map[command.Verb]CommandFn{
+		command.EditVerb:   e.Edit,
+		command.StatusVerb: e.Status,
 	}
 }
 
@@ -51,15 +53,14 @@ type BindingsStorage interface {
 
 // SourceBindingExecutor provides functionality to run all Botkube SourceBinding related commands.
 type SourceBindingExecutor struct {
-	log               logrus.FieldLogger
-	analyticsReporter AnalyticsReporter
-	cfgManager        BindingsStorage
-	sources           map[string]string
-	cfg               config.Config
+	log        logrus.FieldLogger
+	cfgManager BindingsStorage
+	sources    map[string]string
+	cfg        config.Config
 }
 
 // NewSourceBindingExecutor returns a new SourceBindingExecutor instance.
-func NewSourceBindingExecutor(log logrus.FieldLogger, analyticsReporter AnalyticsReporter, cfgManager BindingsStorage, cfg config.Config) *SourceBindingExecutor {
+func NewSourceBindingExecutor(log logrus.FieldLogger, cfgManager BindingsStorage, cfg config.Config) *SourceBindingExecutor {
 	normalizedSource := map[string]string{}
 	for key, item := range cfg.Sources {
 		displayName := item.DisplayName
@@ -70,19 +71,18 @@ func NewSourceBindingExecutor(log logrus.FieldLogger, analyticsReporter Analytic
 	}
 
 	return &SourceBindingExecutor{
-		log:               log,
-		analyticsReporter: analyticsReporter,
-		cfgManager:        cfgManager,
-		sources:           normalizedSource,
-		cfg:               cfg,
+		log:        log,
+		cfgManager: cfgManager,
+		sources:    normalizedSource,
+		cfg:        cfg,
 	}
 }
 
 // Status returns all sources per given channel
-func (e *SourceBindingExecutor) Status(_ context.Context, cmdCtx CommandContext) (interactive.Message, error) {
+func (e *SourceBindingExecutor) Status(_ context.Context, cmdCtx CommandContext) (interactive.CoreMessage, error) {
 	sources := e.currentlySelectedOptions(cmdCtx.CommGroupName, cmdCtx.Platform, cmdCtx.Conversation.ID)
 	if len(sources) == 0 {
-		return interactive.Message{}, nil
+		return interactive.CoreMessage{}, nil
 	}
 	sort.Strings(sources)
 
@@ -101,36 +101,22 @@ func (e *SourceBindingExecutor) Status(_ context.Context, cmdCtx CommandContext)
 }
 
 // Edit executes the edit command based on args.
-func (e *SourceBindingExecutor) Edit(_ context.Context, cmdCtx CommandContext) (interactive.Message, error) {
-	var empty interactive.Message
+func (e *SourceBindingExecutor) Edit(ctx context.Context, cmdCtx CommandContext) (interactive.CoreMessage, error) {
+	var empty interactive.CoreMessage
 
 	if len(cmdCtx.Args) < 2 {
 		return empty, errInvalidCommand
 	}
-
-	var (
-		cmdName = cmdCtx.Args[0]
-		cmdVerb = cmdCtx.Args[1]
-		cmdArgs = cmdCtx.Args[2:]
-	)
-
-	defer func() {
-		cmdToReport := fmt.Sprintf("%s %s", cmdName, cmdVerb)
-		err := e.analyticsReporter.ReportCommand(cmdCtx.Platform, cmdToReport, cmdCtx.Conversation.CommandOrigin, false)
-		if err != nil {
-			e.log.Errorf("while reporting edit command: %s", err.Error())
-		}
-	}()
-
-	msg, err := e.editSourceBindingHandler(cmdArgs, cmdCtx.CommGroupName, cmdCtx.Platform, cmdCtx.Conversation, cmdCtx.User, cmdCtx.BotName)
+	cmdArgs := cmdCtx.Args[2:]
+	msg, err := e.editSourceBindingHandler(ctx, cmdArgs, cmdCtx.CommGroupName, cmdCtx.Platform, cmdCtx.Conversation, cmdCtx.User.Mention)
 	if err != nil {
 		return empty, err
 	}
 	return msg, nil
 }
 
-func (e *SourceBindingExecutor) editSourceBindingHandler(cmdArgs []string, commGroupName string, platform config.CommPlatformIntegration, conversation Conversation, userID, botName string) (interactive.Message, error) {
-	var empty interactive.Message
+func (e *SourceBindingExecutor) editSourceBindingHandler(ctx context.Context, cmdArgs []string, commGroupName string, platform config.CommPlatformIntegration, conversation Conversation, userID string) (interactive.CoreMessage, error) {
+	var empty interactive.CoreMessage
 
 	sourceBindings, err := e.normalizeSourceItems(cmdArgs)
 	if err != nil {
@@ -139,22 +125,38 @@ func (e *SourceBindingExecutor) editSourceBindingHandler(cmdArgs []string, commG
 
 	if len(sourceBindings) == 0 {
 		selectedOptions := e.mapToOptions(e.currentlySelectedOptions(commGroupName, platform, conversation.ID))
-		return interactive.Message{
-			Type: interactive.Popup,
-			Base: interactive.Base{
+		allOpts := e.allOptions()
+		if len(allOpts) == 0 {
+			return interactive.CoreMessage{
 				Header: "Adjust notifications",
-			},
-			OnlyVisibleForYou: true,
-			Sections: []interactive.Section{
-				{
-					MultiSelect: interactive.MultiSelect{
-						Name: "Adjust notifications",
-						Description: interactive.Body{
-							Plaintext: "Select notification sources.",
+				Message: api.Message{
+					OnlyVisibleForYou: true,
+					Sections: []api.Section{
+						{
+							Base: api.Base{
+								Description: "You haven't configured any source plugins. For instructions on how to configure source plugins, please visit https://docs.botkube.io/usage/source.",
+							},
 						},
-						Command:        fmt.Sprintf("%s %s", botName, "edit SourceBindings"),
-						Options:        e.allOptions(),
-						InitialOptions: selectedOptions,
+					},
+				},
+			}, nil
+		}
+		return interactive.CoreMessage{
+			Header: "Adjust notifications",
+			Message: api.Message{
+				Type:              api.PopupMessage,
+				OnlyVisibleForYou: true,
+				Sections: []api.Section{
+					{
+						MultiSelect: api.MultiSelect{
+							Name: "Adjust notifications",
+							Description: api.Body{
+								Plaintext: "Select notification sources.",
+							},
+							Command:        fmt.Sprintf("%s %s", api.MessageBotNamePlaceholder, "edit SourceBindings"),
+							Options:        allOpts,
+							InitialOptions: selectedOptions,
+						},
 					},
 				},
 			},
@@ -166,7 +168,7 @@ func (e *SourceBindingExecutor) editSourceBindingHandler(cmdArgs []string, commG
 		return e.generateUnknownMessage(unknown), nil
 	}
 
-	err = e.cfgManager.PersistSourceBindings(context.Background(), commGroupName, platform, conversation.Alias, sourceBindings)
+	err = e.cfgManager.PersistSourceBindings(ctx, commGroupName, platform, conversation.Alias, sourceBindings)
 	if err != nil {
 		return empty, fmt.Errorf("while persisting source bindings configuration: %w", err)
 	}
@@ -178,9 +180,11 @@ func (e *SourceBindingExecutor) editSourceBindingHandler(cmdArgs []string, commG
 		userID = "Anonymous"
 	}
 
-	return interactive.Message{
-		Base: interactive.Base{
-			Description: e.getEditedSourceBindingsMsg(userID, sourceList),
+	return interactive.CoreMessage{
+		Message: api.Message{
+			BaseBody: api.Body{
+				Plaintext: e.getEditedSourceBindingsMsg(userID, sourceList),
+			},
 		},
 	}, nil
 }
@@ -193,20 +197,22 @@ func (e *SourceBindingExecutor) getEditedSourceBindingsMsg(userID, sourceList st
 	return fmt.Sprintf(editedSourcesMsgFmt, userID, sourceList)
 }
 
-func (e *SourceBindingExecutor) generateUnknownMessage(unknown []string) interactive.Message {
+func (e *SourceBindingExecutor) generateUnknownMessage(unknown []string) interactive.CoreMessage {
 	list := english.OxfordWordSeries(e.quoteEachItem(unknown), "and")
 	word := english.PluralWord(len(unknown), "source was", "sources were")
-	return interactive.Message{
-		Base: interactive.Base{
-			Description: fmt.Sprintf(unknownSourcesMsgFmt, list, word),
+	return interactive.CoreMessage{
+		Message: api.Message{
+			BaseBody: api.Body{
+				Plaintext: fmt.Sprintf(unknownSourcesMsgFmt, list, word),
+			},
 		},
 	}
 }
 
 func (e *SourceBindingExecutor) currentlySelectedOptions(commGroupName string, platform config.CommPlatformIntegration, conversationID string) []string {
 	switch platform {
-	case config.SlackCommPlatformIntegration:
-		channels := e.cfg.Communications[commGroupName].Slack.Channels
+	case config.CloudSlackCommPlatformIntegration:
+		channels := e.cfg.Communications[commGroupName].CloudSlack.Channels
 		for _, channel := range channels {
 			if channel.Identifier() != conversationID {
 				continue
@@ -237,8 +243,6 @@ func (e *SourceBindingExecutor) currentlySelectedOptions(commGroupName string, p
 			}
 			return channel.Bindings.Sources
 		}
-	case config.TeamsCommPlatformIntegration:
-		return e.cfg.Communications[commGroupName].Teams.Bindings.Sources
 	}
 	return nil
 }
@@ -251,14 +255,14 @@ func (e *SourceBindingExecutor) mapToDisplayNames(in []string) []string {
 	return out
 }
 
-func (e *SourceBindingExecutor) mapToOptions(in []string) []interactive.OptionItem {
-	var options []interactive.OptionItem
+func (e *SourceBindingExecutor) mapToOptions(in []string) []api.OptionItem {
+	var options []api.OptionItem
 	for _, key := range in {
 		displayName, found := e.sources[key]
 		if !found {
 			continue
 		}
-		options = append(options, interactive.OptionItem{
+		options = append(options, api.OptionItem{
 			Name:  displayName,
 			Value: key,
 		})
@@ -266,10 +270,10 @@ func (e *SourceBindingExecutor) mapToOptions(in []string) []interactive.OptionIt
 	return options
 }
 
-func (e *SourceBindingExecutor) allOptions() []interactive.OptionItem {
-	var options []interactive.OptionItem
+func (e *SourceBindingExecutor) allOptions() []api.OptionItem {
+	var options []api.OptionItem
 	for key, displayName := range e.sources {
-		options = append(options, interactive.OptionItem{
+		options = append(options, api.OptionItem{
 			Name:  displayName,
 			Value: key,
 		})

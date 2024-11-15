@@ -9,13 +9,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/kubeshop/botkube/internal/loggerx"
 	"github.com/kubeshop/botkube/pkg/action"
+	"github.com/kubeshop/botkube/pkg/api"
 	"github.com/kubeshop/botkube/pkg/bot/interactive"
 	"github.com/kubeshop/botkube/pkg/config"
-	"github.com/kubeshop/botkube/pkg/event"
 	"github.com/kubeshop/botkube/pkg/execute"
 	"github.com/kubeshop/botkube/pkg/execute/command"
+	"github.com/kubeshop/botkube/pkg/loggerx"
 )
 
 func TestProvider_RenderedActionsForEvent(t *testing.T) {
@@ -23,9 +23,9 @@ func TestProvider_RenderedActionsForEvent(t *testing.T) {
 	testCases := []struct {
 		Name               string
 		Config             config.Actions
-		Event              event.Event
+		Event              event
 		SourceBindings     []string
-		ExpectedResult     []event.Action
+		ExpectedResult     []action.Action
 		ExpectedErrMessage string
 	}{
 		{
@@ -33,7 +33,7 @@ func TestProvider_RenderedActionsForEvent(t *testing.T) {
 			Config:         fixActionsConfig(),
 			SourceBindings: []string{"success", "disabled"},
 			Event:          fixEvent("name"),
-			ExpectedResult: []event.Action{
+			ExpectedResult: []action.Action{
 				{
 					Command:          "{{BotName}} kubectl get po name",
 					ExecutorBindings: []string{"executor-binding1", "executor-binding2"},
@@ -53,7 +53,7 @@ func TestProvider_RenderedActionsForEvent(t *testing.T) {
 			Config:         fixActionsConfig(),
 			SourceBindings: []string{"success", "invalid-command"},
 			Event:          fixEvent("name"),
-			ExpectedResult: []event.Action{
+			ExpectedResult: []action.Action{
 				{
 					Command:          "{{BotName}} kubectl get po name",
 					ExecutorBindings: []string{"executor-binding1", "executor-binding2"},
@@ -71,7 +71,7 @@ func TestProvider_RenderedActionsForEvent(t *testing.T) {
 			provider := action.NewProvider(loggerx.NewNoop(), tc.Config, nil)
 
 			// when
-			result, err := provider.RenderedActionsForEvent(tc.Event, tc.SourceBindings)
+			result, err := provider.RenderedActions(tc.Event, tc.SourceBindings)
 
 			// then
 			if tc.ExpectedErrMessage != "" {
@@ -88,35 +88,37 @@ func TestProvider_RenderedActionsForEvent(t *testing.T) {
 func TestProvider_ExecuteEventAction(t *testing.T) {
 	// given
 	botName := "my-bot"
+	userName := `Automation "Test"`
 	executorBindings := []string{"executor-binding1", "executor-binding2"}
-	eventAction := event.Action{
+	eventAction := action.Action{
 		Command:          "kubectl get po foo",
 		ExecutorBindings: executorBindings,
 		DisplayName:      "Test",
 	}
 	expectedExecutorInput := execute.NewDefaultInput{
-		CommGroupName:   "unknown",
-		Platform:        "unknown",
+		CommGroupName:   "n/a",
+		Platform:        "n/a",
 		NotifierHandler: nil, // won't check it
 		Conversation: execute.Conversation{
-			Alias:            "unknown",
-			ID:               "unknown",
+			Alias:            "n/a",
+			ID:               "n/a",
 			ExecutorBindings: executorBindings,
-			IsAuthenticated:  true,
+			IsKnown:          true,
 			CommandOrigin:    command.AutomationOrigin,
-			State:            nil,
 		},
 		Message: "kubectl get po foo",
-		User:    `Automation "Test"`,
+		User: execute.UserInput{
+			Mention:     userName,
+			DisplayName: userName,
+		},
 	}
 
 	execFactory := &fakeFactory{t: t, expectedInput: expectedExecutorInput}
 	provider := action.NewProvider(loggerx.NewNoop(), config.Actions{}, execFactory)
 
 	// when
-	res := provider.ExecuteEventAction(context.Background(), eventAction)
-
-	msg := res.ForBot(botName)
+	msg := provider.ExecuteAction(context.Background(), eventAction)
+	msg.ReplaceBotNamePlaceholder(botName)
 
 	// then
 	assert.Equal(t, fixInteractiveMessage(botName), msg)
@@ -165,8 +167,12 @@ func fixActionsConfig() config.Actions {
 	}
 }
 
-func fixEvent(name string) event.Event {
-	return event.Event{
+type event struct {
+	Name string
+}
+
+func fixEvent(name string) event {
+	return event{
 		Name: name,
 	}
 }
@@ -185,21 +191,21 @@ func (f *fakeFactory) NewDefault(input execute.NewDefaultInput) execute.Executor
 
 type fakeExecutor struct{}
 
-func (fakeExecutor) Execute(_ context.Context) interactive.Message {
+func (fakeExecutor) Execute(_ context.Context) interactive.CoreMessage {
 	return fixInteractiveMessage("{{BotName}}")
 }
 
-func fixInteractiveMessage(botName string) interactive.Message {
-	return interactive.Message{
-		Base: interactive.Base{
-			Header: "Sample",
-		},
-		PlaintextInputs: []interactive.LabelInput{
-			{
-				Command:          fmt.Sprintf("%s kubectl get po foo", botName),
-				Text:             "",
-				Placeholder:      "",
-				DispatchedAction: "",
+func fixInteractiveMessage(botName string) interactive.CoreMessage {
+	return interactive.CoreMessage{
+		Header: "Sample",
+		Message: api.Message{
+			PlaintextInputs: []api.LabelInput{
+				{
+					Command:          fmt.Sprintf("%s kubectl get po foo", botName),
+					Text:             "",
+					Placeholder:      "",
+					DispatchedAction: "",
+				},
 			},
 		},
 	}

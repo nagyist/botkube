@@ -3,70 +3,113 @@ package interactive
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"gotest.tools/v3/golden"
 
-	formatx "github.com/kubeshop/botkube/pkg/format"
+	"github.com/kubeshop/botkube/pkg/api"
+	"github.com/kubeshop/botkube/pkg/formatx"
 )
 
 // go test -run=TestInteractiveMessageToMarkdownMultiSelect ./pkg/bot/interactive/... -test.update-golden
 func TestInteractiveMessageToMarkdownMultiSelect(t *testing.T) {
 	// given
-	message := Message{
-		Base: Base{
-			Header: "Adjust notifications",
-		},
-
-		Sections: []Section{
-			{
-				MultiSelect: MultiSelect{
-					Name: "Adjust notifications",
-					Description: Body{
-						Plaintext: "Select notification sources",
-					},
-					Command: "@Botkube edit SourceBindings",
-					Options: []OptionItem{
-						{
-							Name:  "K8s all events",
-							Value: "k8s-all-events",
+	message := CoreMessage{
+		Header:      "Adjust notifications",
+		Description: "Adjust notifications description",
+		Message: api.Message{
+			Timestamp: time.Date(2022, 04, 21, 2, 43, 0, 0, time.UTC),
+			Sections: []api.Section{
+				{
+					MultiSelect: api.MultiSelect{
+						Name: "Adjust notifications",
+						Description: api.Body{
+							Plaintext: "Select notification sources",
 						},
-						{
-							Name:  "K8s recommendations",
-							Value: "k8s-recommendations",
+						Command: "@Botkube edit SourceBindings",
+						Options: []api.OptionItem{
+							{
+								Name:  "K8s all events",
+								Value: "k8s-all-events",
+							},
+							{
+								Name:  "K8s recommendations",
+								Value: "k8s-recommendations",
+							},
 						},
 					},
 				},
-			},
-			{
-				Selects: Selects{
-					Items: []Select{
+				{
+					TextFields: api.TextFields{
 						{
-							Name:    "Commands",
-							Command: "@Botkube kcc",
-							OptionGroups: []OptionGroup{
-								{
-									Name: "Workloads",
-									Options: []OptionItem{
-										{
-											Name:  "pods",
-											Value: "pods",
-										},
-										{
-											Name:  "deployments",
-											Value: "deployments",
+							Key:   "Kind",
+							Value: "pod",
+						},
+						{
+							Key:   "Namespace",
+							Value: "botkube",
+						},
+						{
+							Key:   "Name",
+							Value: "webapp-server-68c5c57f6f",
+						},
+						{
+							Key:   "Reason",
+							Value: "BackOff",
+						},
+					},
+				},
+				{
+					BulletLists: api.BulletLists{
+						{
+							Title: "Messages",
+							Items: []string{
+								"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt",
+								"Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium",
+								"At vero eos et accusamus et iusto odio dignissimos ducimus qui blanditiis praesentium",
+							},
+						},
+						{
+							Title: "Issues",
+							Items: []string{
+								"Issue item 1",
+								"Issue item 2",
+								"Issue item 3",
+							},
+						},
+					},
+				},
+				{
+					Selects: api.Selects{
+						Items: []api.Select{
+							{
+								Name:    "Commands",
+								Command: "@Botkube kcc",
+								OptionGroups: []api.OptionGroup{
+									{
+										Name: "Workloads",
+										Options: []api.OptionItem{
+											{
+												Name:  "pods",
+												Value: "pods",
+											},
+											{
+												Name:  "deployments",
+												Value: "deployments",
+											},
 										},
 									},
-								},
-								{
-									Name: "Data",
-									Options: []OptionItem{
-										{
-											Name:  "configmap",
-											Value: "configmap",
-										},
-										{
-											Name:  "secrets",
-											Value: "secrets",
+									{
+										Name: "Data",
+										Options: []api.OptionItem{
+											{
+												Name:  "configmap",
+												Value: "configmap",
+											},
+											{
+												Name:  "secrets",
+												Value: "secrets",
+											},
 										},
 									},
 								},
@@ -88,21 +131,21 @@ func TestInteractiveMessageToMarkdownMultiSelect(t *testing.T) {
 // go test -run=TestInteractiveMessageToMarkdown ./pkg/bot/interactive/... -test.update-golden
 func TestInteractiveMessageToMarkdown(t *testing.T) {
 	formatterForCustomNewLines := MDFormatter{
-		newlineFormatter: func(msg string) string {
+		NewlineFormatter: func(msg string) string {
 			return fmt.Sprintf("%s<br>", msg)
 		},
-		headerFormatter:            MdHeaderFormatter,
-		codeBlockFormatter:         formatx.CodeBlock,
-		adaptiveCodeBlockFormatter: formatx.AdaptiveCodeBlock,
+		HeaderFormatter:            MdHeaderFormatter,
+		CodeBlockFormatter:         formatx.CodeBlock,
+		AdaptiveCodeBlockFormatter: formatx.AdaptiveCodeBlock,
 	}
 
 	formatterForCustomHeaders := MDFormatter{
-		newlineFormatter: NewlineFormatter,
-		headerFormatter: func(msg string) string {
+		NewlineFormatter: NewlineFormatter,
+		HeaderFormatter: func(msg string) string {
 			return fmt.Sprintf("*%s*", msg)
 		},
-		codeBlockFormatter:         formatx.CodeBlock,
-		adaptiveCodeBlockFormatter: formatx.AdaptiveCodeBlock,
+		CodeBlockFormatter:         formatx.CodeBlock,
+		AdaptiveCodeBlockFormatter: formatx.AdaptiveCodeBlock,
 	}
 	tests := []struct {
 		name        string
@@ -120,7 +163,8 @@ func TestInteractiveMessageToMarkdown(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			// given
-			given := NewHelpMessage("platform", "testing", "@Botkube", nil).Build()
+			given := NewHelpMessage("platform", "testing", []string{"botkube/kubectl"}).Build(true)
+			given.ReplaceBotNamePlaceholder("@Botkube")
 
 			// when
 			out := RenderMessage(tc.mdFormatter, given)

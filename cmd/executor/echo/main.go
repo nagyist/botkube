@@ -2,19 +2,25 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"errors"
+	"fmt"
 	"strings"
 
-	"github.com/MakeNowJust/heredoc"
-	"github.com/hashicorp/go-plugin"
-	"gopkg.in/yaml.v3"
+	goplugin "github.com/hashicorp/go-plugin"
 
 	"github.com/kubeshop/botkube/pkg/api"
 	"github.com/kubeshop/botkube/pkg/api/executor"
+	"github.com/kubeshop/botkube/pkg/plugin"
 )
 
-// version is set via ldflags by GoReleaser.
-var version = "dev"
+var (
+	// version is set via ldflags by GoReleaser.
+	version = "dev"
+
+	//go:embed config_schema.json
+	configJSONSchema string
+)
 
 const (
 	pluginName  = "echo"
@@ -29,30 +35,25 @@ type Config struct {
 // EchoExecutor implements Botkube executor plugin.
 type EchoExecutor struct{}
 
+var _ executor.Executor = &EchoExecutor{}
+
 // Metadata returns details about Echo plugin.
-func (EchoExecutor) Metadata(context.Context) (api.MetadataOutput, error) {
+func (*EchoExecutor) Metadata(context.Context) (api.MetadataOutput, error) {
 	return api.MetadataOutput{
 		Version:     version,
 		Description: description,
-		JSONSchema:  jsonSchema(),
+		JSONSchema: api.JSONSchema{
+			Value: configJSONSchema,
+		},
 	}, nil
 }
 
 // Execute returns a given command as response.
-func (EchoExecutor) Execute(_ context.Context, in executor.ExecuteInput) (executor.ExecuteOutput, error) {
-	// In our case we don't have complex merge strategy,
-	// the last one that was specified wins :)
-	finalCfg := Config{}
-	for _, inputCfg := range in.Configs {
-		var cfg Config
-		err := yaml.Unmarshal(inputCfg.RawYAML, &cfg)
-		if err != nil {
-			return executor.ExecuteOutput{}, err
-		}
-		if cfg.ChangeResponseToUpperCase == nil {
-			continue
-		}
-		finalCfg.ChangeResponseToUpperCase = cfg.ChangeResponseToUpperCase
+func (*EchoExecutor) Execute(_ context.Context, in executor.ExecuteInput) (executor.ExecuteOutput, error) {
+	var cfg Config
+	err := plugin.MergeExecutorConfigs(in.Configs, &cfg)
+	if err != nil {
+		return executor.ExecuteOutput{}, fmt.Errorf("while merging input configuration: %w", err)
 	}
 
 	data := in.Command
@@ -60,37 +61,28 @@ func (EchoExecutor) Execute(_ context.Context, in executor.ExecuteInput) (execut
 		return executor.ExecuteOutput{}, errors.New("The @fail label was specified. Failing execution.")
 	}
 
-	if finalCfg.ChangeResponseToUpperCase != nil && *finalCfg.ChangeResponseToUpperCase {
+	if strings.Contains(data, "@panic") {
+		panic("The @panic label was specified. Panicking.")
+	}
+
+	if cfg.ChangeResponseToUpperCase != nil && *cfg.ChangeResponseToUpperCase {
 		data = strings.ToUpper(data)
 	}
 
 	return executor.ExecuteOutput{
-		Data: data,
+		Message: api.NewCodeBlockMessage(data, true),
 	}, nil
 }
 
+// Help returns help message
+func (*EchoExecutor) Help(context.Context) (api.Message, error) {
+	return api.Message{}, nil
+}
+
 func main() {
-	executor.Serve(map[string]plugin.Plugin{
+	executor.Serve(map[string]goplugin.Plugin{
 		pluginName: &executor.Plugin{
 			Executor: &EchoExecutor{},
 		},
 	})
-}
-
-func jsonSchema() api.JSONSchema {
-	return api.JSONSchema{
-		Value: heredoc.Docf(`{
-			"$schema": "http://json-schema.org/draft-04/schema#",
-			"title": "botkube/echo",
-			"description": "%s",
-			"type": "object",
-			"properties": {
-				"changeResponseToUpperCase": {
-					"description": "When changeResponseToUpperCase is true, the echoed string will be in upper case",
-					"type": "boolean"
-				}
-			},
-			"required": []
-		}`, description),
-	}
 }

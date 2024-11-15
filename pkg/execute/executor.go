@@ -6,15 +6,20 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/kubeshop/botkube/internal/analytics"
+	"github.com/kubeshop/botkube/internal/audit"
+	remoteapi "github.com/kubeshop/botkube/internal/remote"
+	"github.com/kubeshop/botkube/pkg/api"
 	"github.com/kubeshop/botkube/pkg/bot/interactive"
 	"github.com/kubeshop/botkube/pkg/config"
+	"github.com/kubeshop/botkube/pkg/execute/alias"
 	"github.com/kubeshop/botkube/pkg/execute/command"
-	"github.com/kubeshop/botkube/pkg/execute/kubectl"
-	"github.com/kubeshop/botkube/pkg/filterengine"
-	"github.com/kubeshop/botkube/pkg/format"
+	"github.com/kubeshop/botkube/pkg/formatx"
+	"github.com/kubeshop/botkube/pkg/plugin"
 )
 
 const (
@@ -25,6 +30,8 @@ const (
 	anonymizedInvalidVerb = "{invalid verb}"
 
 	lineLimitToShowFilter = 16
+
+	invalidCmdWithUsage = "error: unknown option `%s`\nusage: %s"
 )
 
 var newLinePattern = regexp.MustCompile(`\r?\n`)
@@ -32,14 +39,11 @@ var newLinePattern = regexp.MustCompile(`\r?\n`)
 // DefaultExecutor is a default implementations of Executor
 type DefaultExecutor struct {
 	cfg                   config.Config
-	filterEngine          filterengine.FilterEngine
 	log                   logrus.FieldLogger
 	analyticsReporter     AnalyticsReporter
-	kubectlExecutor       *Kubectl
 	pluginExecutor        *PluginExecutor
 	sourceBindingExecutor *SourceBindingExecutor
 	actionExecutor        *ActionExecutor
-	filterExecutor        *FilterExecutor
 	pingExecutor          *PingExecutor
 	versionExecutor       *VersionExecutor
 	helpExecutor          *HelpExecutor
@@ -52,54 +56,44 @@ type DefaultExecutor struct {
 	message               string
 	platform              config.CommPlatformIntegration
 	conversation          Conversation
-	merger                *kubectl.Merger
-	cfgManager            ConfigPersistenceManager
 	commGroupName         string
-	user                  string
-	kubectlCmdBuilder     *KubectlCmdBuilder
+	user                  UserInput
 	cmdsMapping           *CommandMapping
-}
-
-// CommandFlags creates custom type for flags in botkube
-type CommandFlags string
-
-// Defines botkube flags
-const (
-	FollowFlag     CommandFlags = "--follow"
-	AbbrFollowFlag CommandFlags = "-f"
-	WatchFlag      CommandFlags = "--watch"
-	AbbrWatchFlag  CommandFlags = "-w"
-)
-
-func (flag CommandFlags) String() string {
-	return string(flag)
+	auditReporter         audit.AuditReporter
+	pluginHealthStats     *plugin.HealthStats
+	auditContext          map[string]interface{}
 }
 
 // Execute executes commands and returns output
-func (e *DefaultExecutor) Execute(ctx context.Context) interactive.Message {
-	empty := interactive.Message{}
-	rawCmd := format.RemoveHyperlinks(e.message)
-	rawCmd = strings.NewReplacer(`“`, `"`, `”`, `"`, `‘`, `"`, `’`, `"`).Replace(rawCmd)
+func (e *DefaultExecutor) Execute(ctx context.Context) interactive.CoreMessage {
+	empty := interactive.CoreMessage{}
+	rawCmd := sanitizeCommand(e.message)
+
+	expandedRawCmd := alias.ExpandPrefix(rawCmd, e.cfg.Aliases)
+	e.log.WithField("rawCmd", rawCmd).WithField("expandedRawCmd", expandedRawCmd).
+		Debugf("Expanding aliases from command...")
+
 	cmdCtx := CommandContext{
-		ClusterName:     e.cfg.Settings.ClusterName,
-		RawCmd:          rawCmd,
-		CommGroupName:   e.commGroupName,
-		BotName:         e.notifierHandler.BotName(),
-		User:            e.user,
-		Conversation:    e.conversation,
-		Platform:        e.platform,
-		NotifierHandler: e.notifierHandler,
-		Mapping:         e.cmdsMapping,
+		ClusterName:       e.cfg.Settings.ClusterName,
+		ExpandedRawCmd:    expandedRawCmd,
+		CommGroupName:     e.commGroupName,
+		User:              e.user,
+		Conversation:      e.conversation,
+		Platform:          e.platform,
+		NotifierHandler:   e.notifierHandler,
+		Mapping:           e.cmdsMapping,
+		PluginHealthStats: e.pluginHealthStats,
+		AuditContext:      e.auditContext,
 	}
 
-	flags, err := ParseFlags(rawCmd)
+	flags, err := ParseFlags(expandedRawCmd)
 	if err != nil {
-		e.log.Errorf("while parsing command flags %q: %s", rawCmd, err.Error())
-		return interactive.Message{
-			Base: interactive.Base{
-				Description: header(cmdCtx),
-				Body: interactive.Body{
-					Plaintext: err.Error(),
+		e.log.WithError(err).WithField("msg", expandedRawCmd).Error("Failed to parse user message")
+		return interactive.CoreMessage{
+			Description: header(cmdCtx),
+			Message: api.Message{
+				BaseBody: api.Body{
+					Plaintext: cantParseCmd,
 				},
 			},
 		}
@@ -107,11 +101,12 @@ func (e *DefaultExecutor) Execute(ctx context.Context) interactive.Message {
 
 	cmdCtx.CleanCmd = flags.CleanCmd
 	cmdCtx.ProvidedClusterName = flags.ClusterName
+	cmdCtx.CmdHeader = flags.CmdHeader
 	cmdCtx.Args = flags.TokenizedCmd
 	cmdCtx.ExecutorFilter = newExecutorTextFilter(flags.Filter)
 
 	if len(cmdCtx.Args) == 0 {
-		if e.conversation.IsAuthenticated {
+		if e.conversation.IsKnown {
 			msg, err := e.helpExecutor.Help(ctx, cmdCtx)
 			if err != nil {
 				e.log.Errorf("while getting help message: %s", err.Error())
@@ -130,47 +125,22 @@ func (e *DefaultExecutor) Execute(ctx context.Context) interactive.Message {
 		return empty // user specified different target cluster
 	}
 
-	if e.kubectlExecutor.CanHandle(cmdCtx.Args) {
-		e.reportCommand(e.kubectlExecutor.GetCommandPrefix(cmdCtx.Args), cmdCtx.ExecutorFilter.IsActive())
-		out, err := e.kubectlExecutor.Execute(e.conversation.ExecutorBindings, cmdCtx.CleanCmd, e.conversation.IsAuthenticated, cmdCtx)
-		switch {
-		case err == nil:
-		case IsExecutionCommandError(err):
-			return respond(err.Error(), cmdCtx)
-		default:
-			// TODO: Return error when the DefaultExecutor is refactored as a part of https://github.com/kubeshop/botkube/issues/589
-			e.log.Errorf("while executing kubectl: %s", err.Error())
-			return empty
-		}
-		return respond(out, cmdCtx)
-	}
-
-	// commands below are executed only if the channel is authorized
-	if !e.conversation.IsAuthenticated {
+	// commands below are executed only if the channel is configured
+	if !e.conversation.IsKnown {
+		e.log.Info("Unknown conversation. Returning empty message...")
 		return empty
-	}
-
-	if e.kubectlCmdBuilder.CanHandle(cmdCtx.Args) {
-		e.reportCommand(e.kubectlCmdBuilder.GetCommandPrefix(cmdCtx.Args), false)
-		out, err := e.kubectlCmdBuilder.Do(ctx, cmdCtx.Args, e.platform, e.conversation.ExecutorBindings, e.conversation.State, cmdCtx.BotName, header(cmdCtx), cmdCtx)
-		if err != nil {
-			// TODO: Return error when the DefaultExecutor is refactored as a part of https://github.com/kubeshop/botkube/issues/589
-			e.log.Errorf("while executing kubectl: %s", err.Error())
-			return empty
-		}
-		return out
 	}
 
 	isPluginCmd := e.pluginExecutor.CanHandle(e.conversation.ExecutorBindings, cmdCtx.Args)
-	if err != nil {
-		// TODO: Return error when the DefaultExecutor is refactored as a part of https://github.com/kubeshop/botkube/issues/589
-		e.log.Errorf("while checking if it's a plugin command: %s", err.Error())
-		return empty
-	}
-
 	if isPluginCmd {
-		e.reportCommand(e.pluginExecutor.GetCommandPrefix(cmdCtx.Args), cmdCtx.ExecutorFilter.IsActive())
-		out, err := e.pluginExecutor.Execute(ctx, e.conversation.ExecutorBindings, cmdCtx.Args, cmdCtx.CleanCmd)
+		_, fullPluginName := e.pluginExecutor.getEnabledPlugins(e.conversation.ExecutorBindings, cmdCtx.Args[0])
+		e.reportCommand(ctx, fullPluginName, e.pluginExecutor.GetCommandPrefix(cmdCtx.Args), cmdCtx.ExecutorFilter.IsActive(), cmdCtx)
+
+		if isHelpCmd(cmdCtx.Args) {
+			return e.ExecuteHelp(ctx, cmdCtx)
+		}
+
+		out, err := e.pluginExecutor.Execute(ctx, e.conversation.ExecutorBindings, e.conversation.SlackState, cmdCtx)
 		switch {
 		case err == nil:
 		case IsExecutionCommandError(err):
@@ -180,10 +150,15 @@ func (e *DefaultExecutor) Execute(ctx context.Context) interactive.Message {
 			e.log.Errorf("while executing command %q: %s", cmdCtx.CleanCmd, err.Error())
 			return empty
 		}
-		return respond(out, cmdCtx)
+		return out
 	}
 
-	cmdVerb := CommandVerb(strings.ToLower(cmdCtx.Args[0]))
+	help, found := GetInstallHelpForKnownPlugin(cmdCtx.Args)
+	if found {
+		return respond(help, cmdCtx)
+	}
+
+	cmdVerb := command.Verb(strings.ToLower(cmdCtx.Args[0]))
 	var cmdRes string
 	if len(cmdCtx.Args) > 1 {
 		cmdRes = strings.ToLower(cmdCtx.Args[1])
@@ -191,16 +166,27 @@ func (e *DefaultExecutor) Execute(ctx context.Context) interactive.Message {
 
 	fn, foundRes, foundFn := e.cmdsMapping.FindFn(cmdVerb, cmdRes)
 	if !foundRes {
-		e.reportCommand(anonymizedInvalidVerb, false)
+		e.reportCommand(ctx, "", anonymizedInvalidVerb, false, cmdCtx)
 		e.log.Infof("received unsupported command: %q", cmdCtx.CleanCmd)
 		return respond(unsupportedCmdMsg, cmdCtx)
 	}
 
 	if !foundFn {
-		e.reportCommand(fmt.Sprintf("%s {invalid feature}", cmdVerb), false)
-		e.log.Infof("received unsupported resource: %q", cmdCtx.CleanCmd)
-		msg := e.cmdsMapping.HelpMessageForVerb(cmdVerb, cmdCtx.BotName)
-		return respond(msg, cmdCtx)
+		reportedCmd := string(cmdVerb)
+		if cmdRes != "" {
+			e.log.Infof("received unsupported resource: %q", cmdCtx.CleanCmd)
+			reportedCmd = fmt.Sprintf("%s {invalid feature}", reportedCmd)
+		}
+		e.reportCommand(ctx, "", reportedCmd, false, cmdCtx)
+		helpMsg := e.cmdsMapping.HelpMessageForVerb(cmdVerb)
+		responseMsg := fmt.Sprintf(invalidCmdWithUsage, cmdRes, helpMsg)
+		return respond(responseMsg, cmdCtx)
+	} else {
+		cmdToReport := string(cmdVerb)
+		if cmdRes != "" {
+			cmdToReport = fmt.Sprintf("%s %s", cmdVerb, cmdRes)
+		}
+		e.reportCommand(ctx, "", cmdToReport, false, cmdCtx)
 	}
 
 	msg, err := fn(ctx, cmdCtx)
@@ -221,51 +207,93 @@ func (e *DefaultExecutor) Execute(ctx context.Context) interactive.Message {
 	return msg
 }
 
-func respond(msg string, cmdCtx CommandContext) interactive.Message {
-	msg = cmdCtx.ExecutorFilter.Apply(msg)
-	msgBody := interactive.Body{
-		CodeBlock: msg,
+func (e *DefaultExecutor) ExecuteHelp(ctx context.Context, cmdCtx CommandContext) interactive.CoreMessage {
+	msg, err := e.pluginExecutor.Help(ctx, e.conversation.ExecutorBindings, cmdCtx)
+	if err != nil {
+		e.log.Errorf("while executing help command %q: %s", cmdCtx.CleanCmd, err.Error())
+		return interactive.CoreMessage{}
 	}
-	if msg == "" {
-		msgBody = interactive.Body{
+	return msg
+}
+
+func respond(body string, cmdCtx CommandContext) interactive.CoreMessage {
+	body = cmdCtx.ExecutorFilter.Apply(body)
+	msgBody := api.Body{
+		CodeBlock: body,
+	}
+	if body == "" {
+		msgBody = api.Body{
 			Plaintext: emptyResponseMsg,
 		}
 	}
 
-	message := interactive.Message{
-		Base: interactive.Base{
-			Description: header(cmdCtx),
-			Body:        msgBody,
+	message := interactive.CoreMessage{
+		Description: header(cmdCtx),
+		Message: api.Message{
+			BaseBody: msgBody,
 		},
 	}
-	// Show Filter Input if command response is more than `lineLimitToShowFilter`
-	if len(strings.SplitN(msg, "\n", lineLimitToShowFilter)) == lineLimitToShowFilter {
-		message.PlaintextInputs = append(message.PlaintextInputs,
-			filterInput(cmdCtx.CleanCmd,
-				cmdCtx.BotName))
-	}
-	return message
+
+	return appendInteractiveFilterIfNeeded(body, message, cmdCtx)
+}
+
+func sanitizeCommand(cmd string) string {
+	outCmd := formatx.RemoveHyperlinks(cmd)
+	outCmd = strings.NewReplacer(`“`, `"`, `”`, `"`, `‘`, `"`, `’`, `"`).Replace(outCmd)
+	outCmd = strings.TrimSpace(outCmd)
+	return outCmd
 }
 
 func header(cmdCtx CommandContext) string {
-	cmd := newLinePattern.ReplaceAllString(cmdCtx.RawCmd, " ")
+	cmd := newLinePattern.ReplaceAllString(cmdCtx.ExpandedRawCmd, " ")
 	cmd = removeMultipleSpaces(cmd)
 	cmd = strings.TrimSpace(cmd)
 	cmd = fmt.Sprintf("`%s`", cmd)
 
+	if cmdCtx.CmdHeader != "" {
+		cmd = cmdCtx.CmdHeader
+	}
 	out := fmt.Sprintf("%s on `%s`", cmd, cmdCtx.ClusterName)
-	return appendByUserOnlyIfNeeded(out, cmdCtx.User, cmdCtx.Conversation.CommandOrigin)
+	return appendByUserOnlyIfNeeded(out, cmdCtx.User.Mention, cmdCtx.Conversation.CommandOrigin)
 }
 
 func removeMultipleSpaces(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-func (e *DefaultExecutor) reportCommand(verb string, withFilter bool) {
-	err := e.analyticsReporter.ReportCommand(e.platform, verb, e.conversation.CommandOrigin, withFilter)
-	if err != nil {
-		e.log.Errorf("while reporting %s command: %s", verb, err.Error())
+func (e *DefaultExecutor) reportCommand(ctx context.Context, pluginName, cmd string, withFilter bool, cmdCtx CommandContext) {
+	if err := e.analyticsReporter.ReportCommand(analytics.ReportCommandInput{
+		Platform:   e.platform,
+		PluginName: pluginName,
+		Command:    cmd,
+		Origin:     e.conversation.CommandOrigin,
+		WithFilter: withFilter,
+	}); err != nil {
+		e.log.Errorf("while reporting %s command: %s", cmd, err.Error())
 	}
+	if err := e.reportAuditEvent(ctx, pluginName, cmdCtx); err != nil {
+		e.log.Errorf("while reporting executor audit event for %s: %s", cmd, err.Error())
+	}
+}
+
+func (e *DefaultExecutor) reportAuditEvent(ctx context.Context, pluginName string, cmdCtx CommandContext) error {
+	platform := remoteapi.NewBotPlatform(cmdCtx.Platform.String())
+
+	channelName := cmdCtx.Conversation.ID
+	if cmdCtx.Conversation.DisplayName != "" {
+		channelName = cmdCtx.Conversation.DisplayName
+	}
+
+	event := audit.ExecutorAuditEvent{
+		PlatformUser:            cmdCtx.User.DisplayName,
+		CreatedAt:               time.Now().Format(time.RFC3339),
+		PluginName:              pluginName,
+		Channel:                 channelName,
+		Command:                 cmdCtx.ExpandedRawCmd,
+		BotPlatform:             platform,
+		AdditionalCreateContext: cmdCtx.AuditContext,
+	}
+	return e.auditReporter.ReportExecutorAuditEvent(ctx, event)
 }
 
 // appendByUserOnlyIfNeeded returns the "by Foo" only if the command was executed via button.
@@ -276,10 +304,10 @@ func appendByUserOnlyIfNeeded(cmd, user string, origin command.Origin) string {
 	return fmt.Sprintf("%s by %s", cmd, user)
 }
 
-func filterInput(id, botName string) interactive.LabelInput {
-	return interactive.LabelInput{
-		Command:          fmt.Sprintf("%s %s --filter=", botName, id),
-		DispatchedAction: interactive.DispatchInputActionOnEnter,
+func filterInput(cmd string) api.LabelInput {
+	return api.LabelInput{
+		Command:          fmt.Sprintf("%s %s --filter=", api.MessageBotNamePlaceholder, cmd),
+		DispatchedAction: api.DispatchInputActionOnEnter,
 		Placeholder:      "String pattern to filter by",
 		Text:             "Filter output",
 	}
@@ -293,4 +321,11 @@ func parseCmdVerb(args []string) (cmd, verb string) {
 		verb = strings.ToLower(args[1])
 	}
 	return
+}
+
+func isHelpCmd(s []string) bool {
+	if len(s) < 2 {
+		return false
+	}
+	return s[1] == "help"
 }

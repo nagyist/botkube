@@ -1,23 +1,52 @@
 package ptr
 
-// ToBool returns bool value for a given pointer.
-func ToBool(in *bool) bool {
-	if in == nil {
-		return false
+import (
+	"golang.org/x/exp/constraints"
+)
+
+// ToSlice converts a given slice of pointers to slice with non-nil elems.
+func ToSlice[T any](in []*T) []T {
+	var out []T
+	for _, s := range in {
+		if s == nil {
+			continue
+		}
+		out = append(out, *s)
 	}
-	return *in
+	return out
 }
 
-// Bool returns pointer to a given input bool value.
-func Bool(in bool) *bool {
+// FromType returns pointer for a given input type.
+func FromType[T any](in T) *T {
 	return &in
 }
 
-// IsTrue returns true if the given pointer is not nil and its value is true.
-func IsTrue(in *bool) bool {
+// Primitives is a constraint that permits any primitive Go types.
+type Primitives interface {
+	constraints.Complex |
+		constraints.Signed |
+		constraints.Unsigned |
+		constraints.Integer |
+		constraints.Float |
+		constraints.Ordered | ~bool
+}
+
+// ToValue returns value for a given pointer input type.
+func ToValue[T Primitives](in *T) T {
+	var empty T
 	if in == nil {
-		return false
+		return empty
+	}
+	return *in
+}
+
+// AreAllSet returns true if all input strings are not nil and not empty.
+func AreAllSet(in ...*string) bool {
+	for _, item := range in {
+		if item == nil || *item == "" {
+			return false
+		}
 	}
 
-	return *in
+	return true
 }

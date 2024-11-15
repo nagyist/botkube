@@ -2,16 +2,21 @@ package analytics
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	segment "github.com/segmentio/analytics-go"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/kubeshop/botkube/internal/analytics/batched"
 	"github.com/kubeshop/botkube/pkg/config"
-	"github.com/kubeshop/botkube/pkg/execute/command"
+	"github.com/kubeshop/botkube/pkg/maputil"
+	"github.com/kubeshop/botkube/pkg/plugin"
+	"github.com/kubeshop/botkube/pkg/ptr"
 	"github.com/kubeshop/botkube/pkg/version"
 )
 
@@ -23,6 +28,8 @@ const (
 	// The labels were copied as it is problematic to add k8s.io/kubernetes dependency: https://github.com/kubernetes/kubernetes/issues/79384
 	controlPlaneNodeLabel           = "node-role.kubernetes.io/control-plane"
 	deprecatedControlPlaneNodeLabel = "node-role.kubernetes.io/master"
+
+	defaultTimeWindowInHours = 1
 )
 
 var (
@@ -32,27 +39,49 @@ var (
 
 var _ Reporter = &SegmentReporter{}
 
+type BatchedDataStore interface {
+	AddSourceEvent(event batched.SourceEvent)
+	HeartbeatProperties() batched.HeartbeatProperties
+	IncrementTimeWindowInHours()
+	Reset()
+}
+
+type pluginReport struct {
+	Name string
+	Type plugin.Type
+	RBAC *config.PolicyRule
+}
+
 // SegmentReporter is a default Reporter implementation that uses Twilio Segment.
 type SegmentReporter struct {
 	log logrus.FieldLogger
 	cli segment.Client
 
 	identity *Identity
+
+	batchedData  BatchedDataStore
+	tickDuration time.Duration
 }
 
 // NewSegmentReporter creates a new SegmentReporter instance.
 func NewSegmentReporter(log logrus.FieldLogger, cli segment.Client) *SegmentReporter {
 	return &SegmentReporter{
-		log: log,
-		cli: cli,
+		log:          log,
+		cli:          cli,
+		batchedData:  batched.NewData(defaultTimeWindowInHours),
+		tickDuration: defaultTimeWindowInHours * time.Hour,
 	}
 }
 
 // RegisterCurrentIdentity loads the current anonymous identity and registers it.
-func (r *SegmentReporter) RegisterCurrentIdentity(ctx context.Context, k8sCli kubernetes.Interface) error {
+func (r *SegmentReporter) RegisterCurrentIdentity(ctx context.Context, k8sCli kubernetes.Interface, remoteDeployID string) error {
 	currentIdentity, err := r.load(ctx, k8sCli)
 	if err != nil {
 		return fmt.Errorf("while loading current identity: %w", err)
+	}
+
+	if remoteDeployID != "" {
+		currentIdentity.DeploymentID = remoteDeployID
 	}
 
 	err = r.registerIdentity(currentIdentity)
@@ -65,65 +94,99 @@ func (r *SegmentReporter) RegisterCurrentIdentity(ctx context.Context, k8sCli ku
 
 // ReportCommand reports a new executed command. The command should be anonymized before using this method.
 // The RegisterCurrentIdentity needs to be called first.
-func (r *SegmentReporter) ReportCommand(platform config.CommPlatformIntegration, command string, origin command.Origin, withFilter bool) error {
+func (r *SegmentReporter) ReportCommand(in ReportCommandInput) error {
 	return r.reportEvent("Command executed", map[string]interface{}{
-		"platform": platform,
-		"command":  command,
-		"origin":   origin,
-		"filtered": withFilter,
+		"platform": in.Platform,
+		"command":  in.Command,
+		"plugin":   in.PluginName,
+		"origin":   in.Origin,
+		"filtered": in.WithFilter,
 	})
 }
 
 // ReportBotEnabled reports an enabled bot.
 // The RegisterCurrentIdentity needs to be called first.
-func (r *SegmentReporter) ReportBotEnabled(platform config.CommPlatformIntegration) error {
+func (r *SegmentReporter) ReportBotEnabled(platform config.CommPlatformIntegration, commGroupIdx int) error {
 	return r.reportEvent("Integration enabled", map[string]interface{}{
-		"platform": platform,
-		"type":     config.BotIntegrationType,
+		"platform":             platform,
+		"type":                 config.BotIntegrationType,
+		"communicationGroupID": commGroupIdx,
 	})
+}
+
+// ReportPluginsEnabled reports plugins enabled.
+func (r *SegmentReporter) ReportPluginsEnabled(executors map[string]config.Executors, sources map[string]config.Sources) error {
+	pluginsConfig := make(map[string]interface{})
+
+	executorKeys := maputil.SortKeys(executors)
+	for i, key := range executorKeys {
+		r.generatePluginsReport(i, pluginsConfig, executors[key].Plugins, plugin.TypeExecutor)
+	}
+
+	sourceKeys := maputil.SortKeys(sources)
+	for i, key := range sourceKeys {
+		r.generatePluginsReport(i, pluginsConfig, sources[key].Plugins, plugin.TypeSource)
+	}
+	return r.reportEvent("Plugin enabled", pluginsConfig)
 }
 
 // ReportSinkEnabled reports an enabled sink.
 // The RegisterCurrentIdentity needs to be called first.
-func (r *SegmentReporter) ReportSinkEnabled(platform config.CommPlatformIntegration) error {
+func (r *SegmentReporter) ReportSinkEnabled(platform config.CommPlatformIntegration, commGroupIdx int) error {
 	return r.reportEvent("Integration enabled", map[string]interface{}{
-		"platform": platform,
-		"type":     config.SinkIntegrationType,
+		"platform":             platform,
+		"type":                 config.SinkIntegrationType,
+		"communicationGroupID": commGroupIdx,
 	})
 }
 
 // ReportHandledEventSuccess reports a successfully handled event using a given communication platform.
 // The RegisterCurrentIdentity needs to be called first.
-func (r *SegmentReporter) ReportHandledEventSuccess(integrationType config.IntegrationType, platform config.CommPlatformIntegration, eventDetails EventDetails) error {
-	return r.reportEvent("Event handled", map[string]interface{}{
-		"platform": platform,
-		"type":     integrationType,
-		"event":    eventDetails,
-		"success":  true,
+func (r *SegmentReporter) ReportHandledEventSuccess(event ReportEventInput) error {
+	r.batchedData.AddSourceEvent(batched.SourceEvent{
+		IntegrationType:       event.IntegrationType,
+		Platform:              event.Platform,
+		PluginName:            event.PluginName,
+		AnonymizedEventFields: event.AnonymizedEventFields,
+		Success:               true,
 	})
+
+	return nil
 }
 
 // ReportHandledEventError reports a failure while handling event using a given communication platform.
 // The RegisterCurrentIdentity needs to be called first.
-func (r *SegmentReporter) ReportHandledEventError(integrationType config.IntegrationType, platform config.CommPlatformIntegration, eventDetails EventDetails, err error) error {
-	return r.reportEvent("Event handled", map[string]interface{}{
-		"platform": platform,
-		"type":     integrationType,
-		"event":    eventDetails,
-		"error":    err.Error(),
+func (r *SegmentReporter) ReportHandledEventError(event ReportEventInput, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	r.batchedData.AddSourceEvent(batched.SourceEvent{
+		IntegrationType:       event.IntegrationType,
+		Platform:              event.Platform,
+		PluginName:            event.PluginName,
+		AnonymizedEventFields: event.AnonymizedEventFields,
+		Success:               false,
+		Error:                 ptr.FromType(err.Error()),
 	})
+
+	return nil
 }
 
 // ReportFatalError reports a fatal app error.
 // It doesn't need a registered identity.
 func (r *SegmentReporter) ReportFatalError(err error) error {
+	if err == nil {
+		return nil
+	}
+
 	properties := map[string]interface{}{
 		"error": err.Error(),
 	}
 
 	var anonymousID string
 	if r.identity != nil {
-		anonymousID = r.identity.ID
+		anonymousID = r.identity.AnonymousID
 	} else {
 		anonymousID = unknownIdentityID
 		properties["unknownIdentity"] = true
@@ -142,10 +205,58 @@ func (r *SegmentReporter) ReportFatalError(err error) error {
 	return nil
 }
 
+// Run runs the reporter.
+func (r *SegmentReporter) Run(ctx context.Context) error {
+	r.log.Debug("Running heartbeat reporting...")
+
+	ticker := time.NewTicker(r.tickDuration)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			err := r.reportHeartbeatEvent()
+			if err != nil {
+				return fmt.Errorf("while reporting heartbeat event: %w", err)
+			}
+
+			return nil
+		case <-ticker.C:
+			err := r.reportHeartbeatEvent()
+			if err != nil {
+				r.log.WithError(err).Debug("Failed to report heartbeat event")
+				r.batchedData.IncrementTimeWindowInHours()
+				continue
+			}
+
+			r.batchedData.Reset()
+		}
+	}
+}
+
 // Close cleans up the reporter resources.
 func (r *SegmentReporter) Close() error {
 	r.log.Info("Closing...")
 	return r.cli.Close()
+}
+
+func (r *SegmentReporter) reportHeartbeatEvent() error {
+	r.log.Debug("Reporting heartbeat event...")
+	heartbeatProps := r.batchedData.HeartbeatProperties()
+
+	// we can't use mapstructure because of this missing feature: https://github.com/mitchellh/mapstructure/issues/249
+	bytes, err := json.Marshal(heartbeatProps)
+	if err != nil {
+		return fmt.Errorf("while marshalling heartbeat properties: %w", err)
+	}
+
+	var props map[string]interface{}
+	err = json.Unmarshal(bytes, &props)
+	if err != nil {
+		return fmt.Errorf("while unmarshalling heartbeat properties: %w", err)
+	}
+
+	return r.reportEvent("Heartbeat", props)
 }
 
 func (r *SegmentReporter) reportEvent(event string, properties map[string]interface{}) error {
@@ -154,7 +265,7 @@ func (r *SegmentReporter) reportEvent(event string, properties map[string]interf
 	}
 
 	err := r.cli.Enqueue(segment.Track{
-		AnonymousId: r.identity.ID,
+		AnonymousId: r.identity.AnonymousID,
 		Event:       event,
 		Properties:  properties,
 	})
@@ -167,7 +278,7 @@ func (r *SegmentReporter) reportEvent(event string, properties map[string]interf
 
 func (r *SegmentReporter) registerIdentity(identity Identity) error {
 	err := r.cli.Enqueue(segment.Identify{
-		AnonymousId: identity.ID,
+		AnonymousId: identity.AnonymousID,
 		Traits:      identity.TraitsMap(),
 	})
 	if err != nil {
@@ -198,7 +309,7 @@ func (r *SegmentReporter) load(ctx context.Context, k8sCli kubernetes.Interface)
 	}
 
 	return Identity{
-		ID:                    clusterID,
+		AnonymousID:           clusterID,
 		KubernetesVersion:     *k8sServerVersion,
 		BotkubeVersion:        version.Info(),
 		WorkerNodeCount:       workerNodeCount,
@@ -245,4 +356,57 @@ func (r *SegmentReporter) getNodeCount(ctx context.Context, k8sCli kubernetes.In
 	}
 
 	return workerNodesCount, controlPlaneNodesCount, nil
+}
+
+func (r *SegmentReporter) generatePluginsReport(cfgGroupIdx int, pluginsConfig map[string]interface{}, plugins config.Plugins, pluginType plugin.Type) {
+	for name, pluginValue := range plugins {
+		if !pluginValue.Enabled {
+			continue
+		}
+
+		key := name
+		if _, exists := pluginsConfig[name]; exists {
+			key = fmt.Sprintf("%s-%d", name, cfgGroupIdx)
+		}
+
+		pluginsConfig[key] = pluginReport{
+			Name: name,
+			Type: pluginType,
+			RBAC: r.getAnonymizedRBAC(pluginValue.Context.RBAC),
+		}
+	}
+}
+
+func (r *SegmentReporter) getAnonymizedRBAC(rbac *config.PolicyRule) *config.PolicyRule {
+	if rbac == nil {
+		return nil
+	}
+
+	var anonymizedGroupValues []string
+	for _, name := range rbac.Group.Static.Values {
+		anonymizedGroupValues = append(anonymizedGroupValues, r.anonymizedValue(name))
+	}
+	return &config.PolicyRule{
+		User: config.UserPolicySubject{
+			Type: rbac.User.Type,
+			Static: config.UserStaticSubject{
+				Value: r.anonymizedValue(rbac.User.Static.Value),
+			},
+			Prefix: r.anonymizedValue(rbac.User.Prefix),
+		},
+		Group: config.GroupPolicySubject{
+			Type: rbac.Group.Type,
+			Static: config.GroupStaticSubject{
+				Values: anonymizedGroupValues,
+			},
+			Prefix: r.anonymizedValue(rbac.Group.Prefix),
+		},
+	}
+}
+
+func (r *SegmentReporter) anonymizedValue(value string) string {
+	if value == "" || value == config.RBACDefaultGroup || value == config.RBACDefaultUser {
+		return value
+	}
+	return "***"
 }

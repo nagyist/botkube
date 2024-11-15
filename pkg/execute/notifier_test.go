@@ -7,23 +7,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/kubeshop/botkube/internal/loggerx"
 	"github.com/kubeshop/botkube/pkg/config"
+	"github.com/kubeshop/botkube/pkg/loggerx"
 )
 
 const (
 	channelAlias  = "alias"
 	commGroupName = "comm-group"
 	clusterName   = "cluster-name"
-	testPlatform  = config.SlackCommPlatformIntegration
-)
-
-var (
-	notifierTestCfg = config.Config{
-		Settings: config.Settings{
-			ClusterName: "foo",
-		},
-	}
+	testPlatform  = config.SocketSlackCommPlatformIntegration
 )
 
 func TestNotifierExecutorStart(t *testing.T) {
@@ -85,17 +77,17 @@ func TestNotifierExecutorStart(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			e := NewNotifierExecutor(loggerx.NewNoop(), &fakeAnalyticsReporter{}, &fakeCfgPersistenceManager{expectedAlias: channelAlias}, notifierTestCfg)
+			e := NewNotifierExecutor(loggerx.NewNoop(), &fakeCfgPersistenceManager{expectedAlias: channelAlias})
 			msg, err := e.Enable(context.Background(), tc.CmdCtx)
 			if err != nil {
 				assert.EqualError(t, err, tc.ExpectedError)
 				return
 			}
-			assert.Equal(t, msg.Body.CodeBlock, tc.ExpectedResult)
+			assert.Equal(t, msg.BaseBody.CodeBlock, tc.ExpectedResult)
 
 			msg, err = e.Status(context.Background(), tc.CmdCtx)
 			require.NoError(t, err)
-			assert.Contains(t, msg.Body.CodeBlock, tc.Status)
+			assert.Contains(t, msg.BaseBody.CodeBlock, tc.Status)
 		})
 	}
 }
@@ -159,17 +151,17 @@ func TestNotifierExecutorStop(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			e := NewNotifierExecutor(loggerx.NewNoop(), &fakeAnalyticsReporter{}, &fakeCfgPersistenceManager{expectedAlias: channelAlias}, notifierTestCfg)
+			e := NewNotifierExecutor(loggerx.NewNoop(), &fakeCfgPersistenceManager{expectedAlias: channelAlias})
 			msg, err := e.Disable(context.Background(), tc.CmdCtx)
 			if err != nil {
 				assert.EqualError(t, err, tc.ExpectedError)
 				return
 			}
-			assert.Equal(t, msg.Body.CodeBlock, tc.ExpectedResult)
+			assert.Equal(t, msg.BaseBody.CodeBlock, tc.ExpectedResult)
 
 			msg, err = e.Status(context.Background(), tc.CmdCtx)
 			require.NoError(t, err)
-			assert.Contains(t, msg.Body.CodeBlock, tc.Status)
+			assert.Contains(t, msg.BaseBody.CodeBlock, tc.Status)
 		})
 	}
 }
@@ -212,13 +204,13 @@ func TestNotifierExecutorStatus(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			e := NewNotifierExecutor(loggerx.NewNoop(), &fakeAnalyticsReporter{}, &fakeCfgPersistenceManager{expectedAlias: channelAlias}, notifierTestCfg)
+			e := NewNotifierExecutor(loggerx.NewNoop(), &fakeCfgPersistenceManager{expectedAlias: channelAlias})
 			mapping, err := NewCmdsMapping([]CommandExecutor{e})
 			require.NoError(t, err)
 			tc.CmdCtx.Mapping = mapping
 			msg, err := e.Status(context.Background(), tc.CmdCtx)
 			require.NoError(t, err)
-			assert.Contains(t, msg.Body.CodeBlock, tc.Status)
+			assert.Contains(t, msg.BaseBody.CodeBlock, tc.Status)
 		})
 	}
 }

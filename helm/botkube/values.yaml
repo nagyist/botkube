@@ -38,6 +38,29 @@ containerSecurityContext:
   allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true
 
+# -- Role Based Access for Botkube Pod and plugins.
+# [Ref doc](https://kubernetes.io/docs/reference/access-authn-authz/rbac/ ).
+rbac:
+  # -- It is used to specify a custom path for mounting a service account to the Botkube deployment.
+  # This is important because we run plugins within the same Pod, and we want to avoid potential bugs when plugins rely on
+  # the default in-cluster K8s client configuration. Instead, they should always use kubeconfig specified directly for a given plugin.
+  serviceAccountMountPath: /var/run/7e7fd2f5-b15d-4803-bc52-f54fba357e76/secrets/kubernetes.io/serviceaccount
+  # -- Configure RBAC resources for Botkube and (deprecated) `staticGroupName` subject with `rules`.
+  # For creating RBAC resources related to plugin permissions, use the `groups` property.
+  create: true
+  # -- Deprecated. Use `rbac.groups` instead.
+  rules: []
+  # -- Deprecated. Use `rbac.groups` instead.
+  staticGroupName: ""
+  # -- Use this to create RBAC resources for specified group subjects.
+  groups:
+    'botkube-plugins-default':
+      create: true
+      rules:
+        - apiGroups: ["*"]
+          resources: ["*"]
+          verbs: ["get", "watch", "list"]
+
 ## Kubeconfig settings used by Botkube.
 kubeconfig:
   # -- If true, enables overriding the Kubernetes auth.
@@ -62,9 +85,10 @@ actions:
     # -- Action display name posted in the channels bound to the same source bindings.
     displayName: "Describe created resource"
     # -- Command to execute when the action is triggered. You can use Go template (https://pkg.go.dev/text/template) together with all helper functions defined by Slim-Sprig library (https://go-task.github.io/slim-sprig).
-    # You can use the `{{ .Event }}` variable, which contains the event object that triggered the action. See all available event properties on https://github.com/kubeshop/botkube/blob/main/pkg/event/event.go.
+    # You can use the `{{ .Event }}` variable, which contains the event object that triggered the action.
+    # See all available Kubernetes event properties on https://github.com/kubeshop/botkube/blob/main/internal/source/kubernetes/event/event.go.
     # @default -- See the `values.yaml` file for the command in the Go template form.
-    command: "kubectl describe {{ .Event.TypeMeta.Kind | lower }}{{ if .Event.Namespace }} -n {{ .Event.Namespace }}{{ end }} {{ .Event.Name }}"
+    command: "kubectl describe {{ .Event.Kind | lower }}{{ if .Event.Namespace }} -n {{ .Event.Namespace }}{{ end }} {{ .Event.Name }}"
 
     # -- Bindings for a given action.
     bindings:
@@ -73,7 +97,7 @@ actions:
         - k8s-create-events
       # -- Executors configuration used to execute a configured command.
       executors:
-        - kubectl-read-only
+        - k8s-default-tools
   'show-logs-on-error':
     # -- If true, enables the action.
     enabled: false
@@ -81,10 +105,10 @@ actions:
     # -- Action display name posted in the channels bound to the same source bindings.
     displayName: "Show logs on error"
     # -- Command to execute when the action is triggered. You can use Go template (https://pkg.go.dev/text/template) together with all helper functions defined by Slim-Sprig library (https://go-task.github.io/slim-sprig).
-    # You can use the `{{ .Event }}` variable, which contains the event object that triggered the action. See all available event properties on https://github.com/kubeshop/botkube/blob/main/pkg/event/event.go.
+    # You can use the `{{ .Event }}` variable, which contains the event object that triggered the action.
+    # See all available Kubernetes event properties on https://github.com/kubeshop/botkube/blob/main/internal/source/kubernetes/event/event.go.
     # @default -- See the `values.yaml` file for the command in the Go template form.
-    command: "kubectl logs {{ .Event.TypeMeta.Kind | lower }}/{{ .Event.Name }} -n {{ .Event.Namespace }}"
-
+    command: "kubectl logs {{ .Event.Kind | lower }}/{{ .Event.Name }} -n {{ .Event.Namespace }}"
     # -- Bindings for a given action.
     bindings:
       # -- Event sources that trigger a given action.
@@ -92,7 +116,7 @@ actions:
         - k8s-err-with-logs-events
       # -- Executors configuration used to execute a configured command.
       executors:
-        - kubectl-read-only
+        - k8s-default-tools
 
 # -- Map of sources. Source contains configuration for Kubernetes events and sending recommendations.
 # The property name under `sources` object is an alias for a given configuration. You can define multiple sources configuration with different names.
@@ -105,263 +129,330 @@ sources:
     displayName: "Kubernetes Recommendations"
     # -- Describes Kubernetes source configuration.
     # @default -- See the `values.yaml` file for full object.
-    kubernetes:
-      # -- Describes configuration for various recommendation insights.
-      recommendations:
-        # -- Recommendations for Pod Kubernetes resource.
-        pod:
-          # -- If true, notifies about Pod containers that use `latest` tag for images.
-          noLatestImageTag: true
-          # -- If true, notifies about Pod resources created without labels.
-          labelsSet: true
-        # -- Recommendations for Ingress Kubernetes resource.
-        ingress:
-          # -- If true, notifies about Ingress resources with invalid backend service reference.
-          backendServiceValid: true
-          # -- If true, notifies about Ingress resources with invalid TLS secret reference.
-          tlsSecretValid: true
+    botkube/kubernetes:
+      context: &default-plugin-context
+        # -- RBAC configuration for this plugin.
+        rbac:
+          group:
+            # -- Static impersonation for a given username and groups.
+            type: Static
+            # -- Prefix that will be applied to .static.value[*].
+            prefix: ""
+            static:
+              # -- Name of group.rbac.authorization.k8s.io the plugin will be bound to.
+              values: ["botkube-plugins-default"]
+          # user:
+            # type: Static
+            # -- Prefix that will be applied to .static.value[*].
+            # prefix: ""
+            # static:
+              # -- Name of user.rbac.authorization.k8s.io the plugin will be bound to.
+              # value: ""
+      enabled: true
+      config:
+        namespaces:
+          include:
+            - ".*"
+        # -- Describes configuration for various recommendation insights.
+        recommendations:
+          # -- Recommendations for Pod Kubernetes resource.
+          pod:
+            # -- If true, notifies about Pod containers that use `latest` tag for images.
+            noLatestImageTag: true
+            # -- If true, notifies about Pod resources created without labels.
+            labelsSet: true
+          # -- Recommendations for Ingress Kubernetes resource.
+          ingress:
+            # -- If true, notifies about Ingress resources with invalid backend service reference.
+            backendServiceValid: true
+            # -- If true, notifies about Ingress resources with invalid TLS secret reference.
+            tlsSecretValid: true
 
   'k8s-all-events':
     displayName: "Kubernetes Info"
     # -- Describes Kubernetes source configuration.
     # @default -- See the `values.yaml` file for full object.
-    kubernetes:
-      # -- Describes namespaces for every Kubernetes resources you want to watch or exclude.
-      # These namespaces are applied to every resource specified in the resources list.
-      # However, every specified resource can override this by using its own namespaces object.
-      namespaces: &k8s-events-namespaces
-        # Include contains a list of allowed Namespaces.
-        # It can also contain a regex expressions:
-        #  `- ".*"` - to specify all Namespaces.
-        include:
-          - ".*"
-        # Exclude contains a list of Namespaces to be ignored even if allowed by Include.
-        # It can also contain a regex expressions:
-        #  `- "test-.*"` - to specif all Namespaces with `test-` prefix.
-        # exclude: []
+    botkube/kubernetes:
+      context: *default-plugin-context
+      enabled: true
+      config:
+        # -- Filter settings for various sources.
+        # @default -- See the `values.yaml` file for full object.
+        filters:
+          # -- If true, enables support for `botkube.io/disable` resource annotation.
+          objectAnnotationChecker: true
+          # -- If true, filters out Node-related events that are not important.
+          nodeEventsChecker: true
+        # -- Describes namespaces for every Kubernetes resources you want to watch or exclude.
+        # These namespaces are applied to every resource specified in the resources list.
+        # However, every specified resource can override this by using its own namespaces object.
+        namespaces: &k8s-events-namespaces
+          # -- Include contains a list of allowed Namespaces.
+          # It can also contain regex expressions:
+          #  `- ".*"` - to specify all Namespaces.
+          include:
+            - ".*"
+          # -- Exclude contains a list of Namespaces to be ignored even if allowed by Include.
+          # It can also contain regex expressions:
+          #  `- "test-.*"` - to specif all Namespaces with `test-` prefix.
+          # Exclude list is checked before the Include list.
+          # exclude: []
 
-      # -- Describes event constraints for Kubernetes resources.
-      # These constraints are applied for every resource specified in the `resources` list, unless they are overridden by the resource's own `events` object.
-      event:
-        # -- Lists all event types to be watched.
-        types:
-          - create
-          - delete
-          - error
-        # -- Optional regex to filter events by event reason.
-        reason: ""
-        # -- Optional regex to filter events by message. If a given event has multiple messages, it is considered a match if any of the messages match the regex.
-        message: ""
+        # -- Describes event constraints for Kubernetes resources.
+        # These constraints are applied for every resource specified in the `resources` list, unless they are overridden by the resource's own `events` object.
+        event:
+          # -- Lists all event types to be watched.
+          types:
+            - create
+            - delete
+            - error
+          # -- Optional list of exact values or regex patterns to filter events by event reason.
+          # Skipped, if both include/exclude lists are empty.
+          reason:
+            # -- Include contains a list of allowed values. It can also contain regex expressions.
+            include: []
+            # -- Exclude contains a list of values to be ignored even if allowed by Include. It can also contain regex expressions.
+            # Exclude list is checked before the Include list.
+            exclude: []
+          # -- Optional list of exact values or regex patterns to filter event by event message. Skipped, if both include/exclude lists are empty.
+          # If a given event has multiple messages, it is considered a match if any of the messages match the constraints.
+          message:
+            # -- Include contains a list of allowed values. It can also contain regex expressions.
+            include: []
+            # -- Exclude contains a list of values to be ignored even if allowed by Include. It can also contain regex expressions.
+            # Exclude list is checked before the Include list.
+            exclude: []
 
-      # -- Filters Kubernetes resources to watch by annotations.
-      annotations: {}
-      # -- Filters Kubernetes resources to watch by labels.
-      labels: {}
+        # -- Filters Kubernetes resources to watch by annotations. Each resource needs to have all the specified annotations.
+        # Regex expressions are not supported.
+        annotations: {}
+        # -- Filters Kubernetes resources to watch by labels. Each resource needs to have all the specified labels.
+        # Regex expressions are not supported.
+        labels: {}
 
-      # -- Describes the Kubernetes resources to watch.
-      # Resources are identified by its type in `{group}/{version}/{kind (plural)}` format. Examples: `apps/v1/deployments`, `v1/pods`.
-      # Each resource can override the namespaces and event configuration by using dedicated `event` and `namespaces` field.
-      # Also, each resource can specify its own `annotations`, `labels` and `name` regex.
-      # @default -- See the `values.yaml` file for full object.
-      resources:
-        - type: v1/pods
-        #  namespaces:             # Overrides 'source'.kubernetes.namespaces
-        #    include:
-        #      - ".*"
-        #    exclude: []
-        #  annotations: {}         # Overrides 'source'.kubernetes.annotations
-        #  labels: {}              # Overrides 'source'.kubernetes.labels
-        #  name: "" # Optional resource name regex.
-        #  event:
-        #    reason: ""            # Overrides 'source'.kubernetes.event.reason
-        #    message: ""           # Overrides 'source'.kubernetes.event.message
-        #    types:                # Overrides 'source'.kubernetes.event.types
-        #      - create
+        # -- Describes the Kubernetes resources to watch.
+        # Resources are identified by its type in `{group}/{version}/{kind (plural)}` format. Examples: `apps/v1/deployments`, `v1/pods`.
+        # Each resource can override the namespaces and event configuration by using dedicated `event` and `namespaces` field.
+        # Also, each resource can specify its own `annotations`, `labels` and `name` regex.
+        # @default -- See the `values.yaml` file for full object.
+        resources:
+          - type: v1/pods
+  #          namespaces:             # Overrides 'source'.kubernetes.namespaces
+  #            include:
+  #              - ".*"
+  #            exclude: []
+  #          annotations: {}         # Overrides 'source'.kubernetes.annotations
+  #          labels: {}              # Overrides 'source'.kubernetes.labels
+  #          # Optional resource name constraints.
+  #          name:
+  #            # Include contains a list of allowed values. It can also contain regex expressions.
+  #            include: []
+  #            # Exclude contains a list of values to be ignored even if allowed by Include. It can also contain regex expressions.
+  #            # Exclude list is checked before the Include list.
+  #            exclude: []
+  #          event:
+  #            # Overrides 'source'.kubernetes.event.reason
+  #            reason:
+  #              include: []
+  #              exclude: []
+  #            # Overrides 'source'.kubernetes.event.message
+  #            message:
+  #              include: []
+  #              exclude: []
+  #            # Overrides 'source'.kubernetes.event.types
+  #            types:
+  #              - create
 
-        - type: v1/services
-        - type: networking.k8s.io/v1/ingresses
-        - type: v1/nodes
-        - type: v1/namespaces
-        - type: v1/persistentvolumes
-        - type: v1/persistentvolumeclaims
-        - type: v1/configmaps
-        - type: rbac.authorization.k8s.io/v1/roles
-        - type: rbac.authorization.k8s.io/v1/rolebindings
-        - type: rbac.authorization.k8s.io/v1/clusterrolebindings
-        - type: rbac.authorization.k8s.io/v1/clusterroles
-        - type: apps/v1/daemonsets
-          event: # Overrides 'source'.kubernetes.event
-            types:
-              - create
-              - update
-              - delete
-              - error
-          updateSetting:
-            includeDiff: true
-            fields:
-              - spec.template.spec.containers[*].image
-              - status.numberReady
-        - type: batch/v1/jobs
-          event: # Overrides 'source'.kubernetes.event
-            types:
-              - create
-              - update
-              - delete
-              - error
-          updateSetting:
-            includeDiff: true
-            fields:
-              - spec.template.spec.containers[*].image
-              - status.conditions[*].type
-        - type: apps/v1/deployments
-          event: # Overrides 'source'.kubernetes.event
-            types:
-              - create
-              - update
-              - delete
-              - error
-          updateSetting:
-            includeDiff: true
-            fields:
-              - spec.template.spec.containers[*].image
-              - status.availableReplicas
-        - type: apps/v1/statefulsets
-          event: # Overrides 'source'.kubernetes.event
-            types:
-              - create
-              - update
-              - delete
-              - error
-          updateSetting:
-            includeDiff: true
-            fields:
-              - spec.template.spec.containers[*].image
-              - status.readyReplicas
-       ## Custom resource example
-       # - type: velero.io/v1/backups
-       #   namespaces:
-       #     include:
-       #       - ".*"
-       #     exclude:
-       #       -
-       #   event:
-       #     types:
-       #       - create
-       #       - update
-       #       - delete
-       #       - error
-       #   updateSetting:
-       #     includeDiff: true
-       #     fields:
-       #       - status.phase
+          - type: v1/services
+          - type: networking.k8s.io/v1/ingresses
+          - type: v1/nodes
+            event:
+              message:
+                exclude:
+                  - ".*nf_conntrack_buckets.*" # Ignore node related noisy messages from GKE clusters
+          - type: v1/namespaces
+          - type: v1/persistentvolumes
+          - type: v1/persistentvolumeclaims
+          - type: v1/configmaps
+          - type: rbac.authorization.k8s.io/v1/roles
+          - type: rbac.authorization.k8s.io/v1/rolebindings
+          - type: rbac.authorization.k8s.io/v1/clusterrolebindings
+          - type: rbac.authorization.k8s.io/v1/clusterroles
+          - type: apps/v1/daemonsets
+            event: # Overrides 'source'.kubernetes.event
+              types:
+                - create
+                - update
+                - delete
+                - error
+            updateSetting:
+              includeDiff: true
+              fields:
+                - spec.template.spec.containers[*].image
+                - status.numberReady
+          - type: batch/v1/jobs
+            event: # Overrides 'source'.kubernetes.event
+              types:
+                - create
+                - update
+                - delete
+                - error
+            updateSetting:
+              includeDiff: true
+              fields:
+                - spec.template.spec.containers[*].image
+                - status.conditions[*].type
+          - type: apps/v1/deployments
+            event: # Overrides 'source'.kubernetes.event
+              types:
+                - create
+                - update
+                - delete
+                - error
+            updateSetting:
+              includeDiff: true
+              fields:
+                - spec.template.spec.containers[*].image
+                - status.availableReplicas
+          - type: apps/v1/statefulsets
+            event: # Overrides 'source'.kubernetes.event
+              types:
+                - create
+                - update
+                - delete
+                - error
+            updateSetting:
+              includeDiff: true
+              fields:
+                - spec.template.spec.containers[*].image
+                - status.readyReplicas
+         ## Custom resource example
+         # - type: velero.io/v1/backups
+         #   namespaces:
+         #     include:
+         #       - ".*"
+         #     exclude:
+         #       -
+         #   event:
+         #     types:
+         #       - create
+         #       - update
+         #       - delete
+         #       - error
+         #   updateSetting:
+         #     includeDiff: true
+         #     fields:
+         #       - status.phase
 
   'k8s-err-events':
     displayName: "Kubernetes Errors"
 
     # -- Describes Kubernetes source configuration.
     # @default -- See the `values.yaml` file for full object.
-    kubernetes:
-      # -- Describes namespaces for every Kubernetes resources you want to watch or exclude.
-      # These namespaces are applied to every resource specified in the resources list.
-      # However, every specified resource can override this by using its own namespaces object.
-      namespaces: *k8s-events-namespaces
+    botkube/kubernetes:
+      context: *default-plugin-context
+      enabled: true
+      config:
+        # -- Describes namespaces for every Kubernetes resources you want to watch or exclude.
+        # These namespaces are applied to every resource specified in the resources list.
+        # However, every specified resource can override this by using its own namespaces object.
+        namespaces: *k8s-events-namespaces
 
-      # -- Describes event constraints for Kubernetes resources.
-      # These constraints are applied for every resource specified in the `resources` list, unless they are overridden by the resource's own `events` object.
-      event:
-        # -- Lists all event types to be watched.
-        types:
-          - error
+        # -- Describes event constraints for Kubernetes resources.
+        # These constraints are applied for every resource specified in the `resources` list, unless they are overridden by the resource's own `events` object.
+        event:
+          # -- Lists all event types to be watched.
+          types:
+            - error
 
-      # -- Describes the Kubernetes resources you want to watch.
-      # @default -- See the `values.yaml` file for full object.
-      resources:
-        - type: v1/pods
-        - type: v1/services
-        - type: networking.k8s.io/v1/ingresses
-        - type: v1/nodes
-        - type: v1/namespaces
-        - type: v1/persistentvolumes
-        - type: v1/persistentvolumeclaims
-        - type: v1/configmaps
-        - type: rbac.authorization.k8s.io/v1/roles
-        - type: rbac.authorization.k8s.io/v1/rolebindings
-        - type: rbac.authorization.k8s.io/v1/clusterrolebindings
-        - type: rbac.authorization.k8s.io/v1/clusterroles
-        - type: apps/v1/deployments
-        - type: apps/v1/statefulsets
-        - type: apps/v1/daemonsets
-        - type: batch/v1/jobs
+        # -- Describes the Kubernetes resources you want to watch.
+        # @default -- See the `values.yaml` file for full object.
+        resources:
+          - type: v1/pods
+          - type: v1/services
+          - type: networking.k8s.io/v1/ingresses
+          - type: v1/nodes
+            event:
+              message:
+                exclude:
+                  - ".*nf_conntrack_buckets.*" # Ignore node related noisy messages from GKE clusters
+          - type: v1/namespaces
+          - type: v1/persistentvolumes
+          - type: v1/persistentvolumeclaims
+          - type: v1/configmaps
+          - type: rbac.authorization.k8s.io/v1/roles
+          - type: rbac.authorization.k8s.io/v1/rolebindings
+          - type: rbac.authorization.k8s.io/v1/clusterrolebindings
+          - type: rbac.authorization.k8s.io/v1/clusterroles
+          - type: apps/v1/deployments
+          - type: apps/v1/statefulsets
+          - type: apps/v1/daemonsets
+          - type: batch/v1/jobs
   'k8s-err-with-logs-events':
     displayName: "Kubernetes Errors for resources with logs"
 
     # -- Describes Kubernetes source configuration.
     # @default -- See the `values.yaml` file for full object.
-    kubernetes:
-      # -- Describes namespaces for every Kubernetes resources you want to watch or exclude.
-      # These namespaces are applied to every resource specified in the resources list.
-      # However, every specified resource can override this by using its own namespaces object.
-      namespaces: *k8s-events-namespaces
+    botkube/kubernetes:
+      context: *default-plugin-context
+      enabled: true
+      config:
+        # -- Describes namespaces for every Kubernetes resources you want to watch or exclude.
+        # These namespaces are applied to every resource specified in the resources list.
+        # However, every specified resource can override this by using its own namespaces object.
+        namespaces: *k8s-events-namespaces
 
-      # -- Describes event constraints for Kubernetes resources.
-      # These constraints are applied for every resource specified in the `resources` list, unless they are overridden by the resource's own `events` object.
-      event:
-        # -- Lists all event types to be watched.
-        types:
-          - error
+        # -- Describes event constraints for Kubernetes resources.
+        # These constraints are applied for every resource specified in the `resources` list, unless they are overridden by the resource's own `events` object.
+        event:
+          # -- Lists all event types to be watched.
+          types:
+            - error
 
-      # -- Describes the Kubernetes resources you want to watch.
-      # @default -- See the `values.yaml` file for full object.
-      resources:
-        - type: v1/pods
-        - type: apps/v1/deployments
-        - type: apps/v1/statefulsets
-        - type: apps/v1/daemonsets
-        - type: batch/v1/jobs
-        # `apps/v1/replicasets` excluded on purpose - to not show logs twice for a given higher-level resource (e.g. Deployment)
+        # -- Describes the Kubernetes resources you want to watch.
+        # @default -- See the `values.yaml` file for full object.
+        resources:
+          - type: v1/pods
+          - type: apps/v1/deployments
+          - type: apps/v1/statefulsets
+          - type: apps/v1/daemonsets
+          - type: batch/v1/jobs
+          # `apps/v1/replicasets` excluded on purpose - to not show logs twice for a given higher-level resource (e.g. Deployment)
 
   'k8s-create-events':
     displayName: "Kubernetes Resource Created Events"
 
     # -- Describes Kubernetes source configuration.
     # @default -- See the `values.yaml` file for full object.
-    kubernetes:
-      # -- Describes namespaces for every Kubernetes resources you want to watch or exclude.
-      # These namespaces are applied to every resource specified in the resources list.
-      # However, every specified resource can override this by using its own namespaces object.
-      namespaces: *k8s-events-namespaces
+    botkube/kubernetes:
+      context: *default-plugin-context
+      enabled: true
+      config:
+        # -- Describes namespaces for every Kubernetes resources you want to watch or exclude.
+        # These namespaces are applied to every resource specified in the resources list.
+        # However, every specified resource can override this by using its own namespaces object.
+        namespaces: *k8s-events-namespaces
 
-      # -- Describes event constraints for Kubernetes resources.
-      # These constraints are applied for every resource specified in the `resources` list, unless they are overridden by the resource's own `events` object.
-      event:
-        # -- Lists all event types to be watched.
-        types:
-          - create
+        # -- Describes event constraints for Kubernetes resources.
+        # These constraints are applied for every resource specified in the `resources` list, unless they are overridden by the resource's own `events` object.
+        event:
+          # -- Lists all event types to be watched.
+          types:
+            - create
 
-      # -- Describes the Kubernetes resources you want to watch.
-      # @default -- See the `values.yaml` file for full object.
-      resources:
-        - type: v1/pods
-        - type: v1/services
-        - type: networking.k8s.io/v1/ingresses
-        - type: v1/nodes
-        - type: v1/namespaces
-        - type: v1/configmaps
-        - type: apps/v1/deployments
-        - type: apps/v1/statefulsets
-        - type: apps/v1/daemonsets
-        - type: batch/v1/jobs
-
-# -- Filter settings for various sources.
-# Currently, all filters are globally enabled or disabled.
-# You can enable or disable filters with `@Botkube enable/disable filters` commands.
-# @default -- See the `values.yaml` file for full object.
-filters:
-  kubernetes:
-    # -- If true, enables support for `botkube.io/disable` and `botkube.io/channel` resource annotations.
-    objectAnnotationChecker: true
-    # -- If true, filters out Node-related events that are not important.
-    nodeEventsChecker: true
+        # -- Describes the Kubernetes resources you want to watch.
+        # @default -- See the `values.yaml` file for full object.
+        resources:
+          - type: v1/pods
+          - type: v1/services
+          - type: networking.k8s.io/v1/ingresses
+          - type: v1/nodes
+          - type: v1/namespaces
+          - type: v1/configmaps
+          - type: apps/v1/deployments
+          - type: apps/v1/statefulsets
+          - type: apps/v1/daemonsets
+          - type: batch/v1/jobs
 
 # -- Map of executors. Executor contains configuration for running `kubectl` commands.
 # The property name under `executors` is an alias for a given configuration. You can define multiple executor configurations with different names.
@@ -370,45 +461,55 @@ filters:
 #
 ## Format: executors.{alias}
 executors:
-  'kubectl-read-only':
-    ## Kubectl executor configuration.
-    kubectl:
-      namespaces:
-        # -- List of allowed Kubernetes Namespaces for command execution.
-        # It can also contain a regex expressions:
-        #  `- ".*"` - to specify all Namespaces.
-        include:
-          - ".*"
-        # -- List of ignored Kubernetes Namespace.
-        # It can also contain a regex expressions:
-        #  `- "test-.*"` - to specify all Namespaces.
-        exclude: []
-      # -- If true, enables `kubectl` commands execution.
-      enabled: false
-      ## List of allowed `kubectl` commands.
-      commands:
-        # -- Configures which `kubectl` methods are allowed.
-        verbs: ["api-resources", "api-versions", "cluster-info", "describe", "explain", "get", "logs", "top"]
-        # -- Configures which K8s resource are allowed.
-        resources: ["deployments", "pods", "namespaces", "daemonsets", "statefulsets", "storageclasses", "nodes", "configmaps", "services", "ingresses"]
-      # -- Configures the default Namespace for executing Botkube `kubectl` commands. If not set, uses the 'default'.
-      defaultNamespace: default
-      # -- If true, enables commands execution from configured channel only.
-      restrictAccess: false
-
-  'helm':
-    ## Helm executor configuration
+  k8s-default-tools:
+    ## Kubectl executor configuration
     ## Plugin name syntax: <repo>/<plugin>[@<version>]. If version is not provided, the latest version from repository is used.
-    botkube/helm:
-      # -- If true, enables `helm` commands execution.
+    botkube/kubectl:
+      displayName: "Kubectl"
       enabled: false
+      # -- Custom kubectl configuration.
+      # @default -- See the `values.yaml` file for full object including optional properties related to interactive builder.
       config:
-        # -- Allowed values are configmap, secret, memory.
-        helmDriver: "secret"
-        # -- Location for storing Helm configuration.
-        helmConfigDir: "/tmp/helm/"
-        # -- Location for storing cached files. Must be under the Helm config directory.
-        helmCacheDir: "/tmp/helm/.cache"
+        # Configures the default Namespace for executing Botkube `kubectl` commands. If not set, uses 'default'.
+        defaultNamespace: "default"
+      #  # Configures Kubectl internal logger. Messages are send to stdout.
+      #  # To see the plugin standard output you need to enable it. Learn more at https://docs.botkube.io/plugin/debugging/.
+      #  log:
+      #    level: "info"
+      #  # Configures the interactive kubectl command builder.
+      #  interactiveBuilder:
+      #    allowed:
+      #      # Configures which K8s namespace are displayed in namespace dropdown.
+      #      # If not specified, plugin needs to have access to fetch all Namespaces, otherwise Namespace dropdown won't be visible at all.
+      #      namespaces: [ "default" ]
+      #      # Configures which `kubectl` methods are displayed in commands dropdown.
+      #      verbs: [ "api-resources", "api-versions", "cluster-info", "describe", "explain", "get", "logs", "top" ]
+      #      # Configures which K8s resource are displayed in resources dropdown.
+      #      resources: [ "deployments", "pods", "namespaces", "daemonsets", "statefulsets", "storageclasses", "nodes", "configmaps", "services", "ingresses", "replicasets", "secrets", "cronjobs", "jobs" ]
+      context: *default-plugin-context
+    botkubeExtra/helm:
+      displayName: "Helm"
+      enabled: true
+      context: *default-plugin-context
+
+# -- Custom aliases for given commands.
+# The aliases are replaced with the underlying command before executing it.
+# Aliases can replace a single word or multiple ones. For example, you can define a `k` alias for `kubectl`, or `kgp` for `kubectl get pods`.
+# @default -- See the `values.yaml` file for full object.
+#
+## Format: aliases.{alias}
+aliases:
+  kc:
+    command: kubectl
+    displayName: "Kubectl alias"
+  k:
+    command: kubectl
+    displayName: "Kubectl alias"
+
+## Multi-word alias example:
+#  kgp:
+#    command: kubectl get pods
+#    displayName: "Get pods"
 
 # -- Configures existing Secret with communication settings. It MUST be in the `botkube` Namespace.
 # To reload Botkube once it changes, add label `botkube.io/config-watch: "true"`.
@@ -427,38 +528,9 @@ existingCommunicationsSecretName: ""
 ## Format: communications.{alias}
 communications:
   'default-group':
-    ## Settings for Slack.
-    slack:
-      # -- If true, enables Slack bot.
-      enabled: false
-      # -- Map of configured channels. The property name under `channels` object is an alias for a given configuration.
-      #
-      ## Format: channels.{alias}
-      channels:
-        'default':
-          # -- Slack channel name without '#' prefix where you have added Botkube and want to receive notifications in.
-          name: 'SLACK_CHANNEL'
-          notification:
-            # -- If true, the notifications are not sent to the channel. They can be enabled with `@Botkube` command anytime.
-            disabled: false
-          bindings:
-            # -- Executors configuration for a given channel.
-            executors:
-              - kubectl-read-only
-              - helm
-            # -- Notification sources configuration for a given channel.
-            sources:
-              - k8s-err-events
-              - k8s-recommendation-events
-      # -- Slack token.
-      token: ''
-      notification:
-        # -- Configures notification type that are sent. Possible values: `short`, `long`.
-        type: short
-
     ## Settings for Slack with Socket Mode.
     socketSlack:
-      # -- If true, enables Slack bot.
+      # -- If true, enables bot for Slack.
       enabled: false
       # -- Map of configured channels. The property name under `channels` object is an alias for a given configuration.
       #
@@ -470,21 +542,17 @@ communications:
           bindings:
             # -- Executors configuration for a given channel.
             executors:
-              - kubectl-read-only
-              - helm
+              - k8s-default-tools
             # -- Notification sources configuration for a given channel.
             sources:
               - k8s-err-events
               - k8s-recommendation-events
-      # -- Slack bot token for your own Slack app.
+      # -- Bot token for your own app for Slack.
       # [Ref doc](https://api.slack.com/authentication/token-types).
       botToken: ''
-      # -- Slack app-level token for your own Slack app.
+      # -- App-level token for your own app for Slack.
       # [Ref doc](https://api.slack.com/authentication/token-types).
       appToken: ''
-      notification:
-        # -- Configures notification type that are sent. Possible values: `short`, `long`.
-        type: short
     ## Settings for Mattermost.
     mattermost:
       # -- If true, enables Mattermost bot.
@@ -511,39 +579,11 @@ communications:
           bindings:
             # -- Executors configuration for a given channel.
             executors:
-              - kubectl-read-only
-              - helm
+              - k8s-default-tools
             # -- Notification sources configuration for a given channel.
             sources:
               - k8s-err-events
               - k8s-recommendation-events
-      notification:
-        # -- Configures notification type that are sent. Possible values: `short`, `long`.
-        type: short
-
-    ## Settings for MS Teams.
-    teams:
-      # -- If true, enables MS Teams bot.
-      enabled: false
-      # -- The Bot name set while registering Bot to MS Teams.
-      botName: 'Botkube'
-      # -- The Botkube application ID generated while registering Bot to MS Teams.
-      appID: 'APPLICATION_ID'
-      # -- The Botkube application password generated while registering Bot to MS Teams.
-      appPassword: 'APPLICATION_PASSWORD'
-      bindings:
-        # -- Executor bindings apply to all MS Teams channels where Botkube has access to.
-        executors:
-          - kubectl-read-only
-          - helm
-        # -- Source bindings apply to all channels which have notification turned on with `@Botkube enable notifications` command.
-        sources:
-          - k8s-err-events
-          - k8s-recommendation-events
-      # -- The path in endpoint URL provided while registering Botkube to MS Teams.
-      messagePath: "/bots/teams"
-      # -- The Service port for bot endpoint on Botkube container.
-      port: 3978
 
     ## Settings for Discord.
     discord:
@@ -567,15 +607,11 @@ communications:
           bindings:
             # -- Executors configuration for a given channel.
             executors:
-              - kubectl-read-only
-              - helm
+              - k8s-default-tools
             # -- Notification sources configuration for a given channel.
             sources:
               - k8s-err-events
               - k8s-recommendation-events
-      notification:
-        # -- Configures notification type that are sent. Possible values: `short`, `long`.
-        type: short
 
     ## Settings for Elasticsearch.
     elasticsearch:
@@ -598,6 +634,14 @@ communications:
       # -- If true, skips the verification of TLS certificate of the Elastic nodes.
       # It's useful for clusters with self-signed certificates.
       skipTLSVerify: false
+      # -- Specify the log level for Elasticsearch client. Leave empty to disable logging.
+      ## Possible values: "info", "error", "trace".
+      ## - "info": Logs information level messages.
+      ## - "error": Logs information and error level messages.
+      ## - "trace": Logs information, error, and trace level messages.
+      ## To disable logging, simply leave the logLevel empty or remove the line.
+      logLevel: ""
+
       # -- Map of configured indices. The `indices` property name is an alias for a given configuration.
       #
       ## Format: indices.{alias}
@@ -631,10 +675,7 @@ settings:
   # -- Cluster name to differentiate incoming messages.
   clusterName: not-configured
 
-  # -- Server configuration which exposes functionality related to the app lifecycle.
-  lifecycleServer:
-    enabled: true
-    port: 2113
+  # -- Health check port.
   healthPort: 2114
   # -- If true, notifies about new Botkube releases.
   upgradeNotifier: true
@@ -642,8 +683,10 @@ settings:
   log:
     # -- Sets one of the log levels. Allowed values: `info`, `warn`, `debug`, `error`, `fatal`, `panic`.
     level: info
-    # -- If true, disable ANSI colors in logging.
+    # -- If true, disable ANSI colors in logging. Ignored when `json` formatter is used.
     disableColors: false
+    # -- Configures log format. Allowed values: `text`, `json`.
+    formatter: json
 
   # -- Botkube's system ConfigMap where internal data is stored.
   systemConfigMap:
@@ -683,17 +726,6 @@ service:
   port: 2112
   targetPort: 2112
 
-# -- Configures Ingress settings that exposes MS Teams endpoint.
-# [Ref doc](https://kubernetes.io/docs/concepts/services-networking/ingress/#the-ingress-resource).
-ingress:
-  create: false
-  annotations:
-    kubernetes.io/ingress.class: nginx
-  host: 'HOST'
-  tls:
-    enabled: false
-    secretName: ''
-
 # -- Configures ServiceMonitor settings.
 # [Ref doc](https://github.com/coreos/prometheus-operator/blob/master/Documentation/api.md#servicemonitor).
 serviceMonitor:
@@ -707,6 +739,31 @@ serviceMonitor:
 deployment:
   # -- Extra annotations to pass to the Botkube Deployment.
   annotations: {}
+  # -- Liveness probe.
+  livenessProbe:
+    # -- The liveness probe initial delay seconds.
+    initialDelaySeconds: 1
+    # -- The liveness probe period seconds.
+    periodSeconds: 2
+    # -- The liveness probe timeout seconds.
+    timeoutSeconds: 1
+    # -- The liveness probe failure threshold.
+    failureThreshold: 35
+    # -- The liveness probe success threshold.
+    successThreshold: 1
+
+  # -- Readiness probe.
+  readinessProbe:
+    # -- The readiness probe initial delay seconds.
+    initialDelaySeconds: 1
+    # -- The readiness probe period seconds.
+    periodSeconds: 2
+    # -- The readiness probe timeout seconds.
+    timeoutSeconds: 1
+    # -- The readiness probe failure threshold.
+    failureThreshold: 35
+    # -- The readiness probe success threshold.
+    successThreshold: 1
 
 # -- Number of Botkube pods to load balance between.
 # Currently, Botkube doesn't support HA.
@@ -727,7 +784,7 @@ fullnameOverride: ""
 # -- The Botkube Pod resource request and limits. We usually recommend not to specify default resources and to leave this as a conscious
 # choice for the user. This also increases chances charts run on environments with little
 # resources, such as Minikube.
-# [Ref docs](https://kubernetes.io/docs/user-guide/compute-resources/)
+# [Ref docs](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)
 resources: {}
   ## If you do want to specify resources, uncomment the following lines,
   ## adjust them as necessary, and remove the curly braces after 'resources:'.
@@ -740,7 +797,9 @@ resources: {}
 
 # -- Extra environment variables to pass to the Botkube container.
 # [Ref docs](https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#environment-variables).
-extraEnv: []
+extraEnv:
+  - name: LOG_LEVEL_SOURCE_BOTKUBE_KUBERNETES
+    value: debug
 #  - name: {key}
 #    valueFrom:
 #      configMapKeyRef:
@@ -784,7 +843,7 @@ extraVolumeMounts: []
 #   readOnly: true
 
 # -- Node labels for Botkube Pod assignment.
-# [Ref doc](https://kubernetes.io/docs/user-guide/node-selection/).
+# [Ref doc](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/).
 nodeSelector: {}
 
 # -- Tolerations for Botkube Pod assignment.
@@ -794,15 +853,6 @@ tolerations: []
 # -- Affinity for Botkube Pod assignment.
 # [Ref doc](https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#affinity-and-anti-affinity).
 affinity: {}
-
-# -- Role Based Access for Botkube Pod.
-# [Ref doc](https://kubernetes.io/docs/admin/authorization/rbac/).
-rbac:
-  create: true
-  rules:
-    - apiGroups: ["*"]
-      resources: ["*"]
-      verbs: ["get", "watch", "list"]
 
 serviceAccount:
   # -- If true, a ServiceAccount is automatically created.
@@ -840,44 +890,53 @@ extraObjects: []
 
 ## Parameters for anonymous analytics collection.
 analytics:
-  # -- If true, sending anonymous analytics is disabled. To learn what date we collect,
-  # see [Privacy Policy](https://docs.botkube.io/privacy#privacy-policy).
+  # -- If true, sending anonymous analytics is disabled. To learn what date we collect, see the [Privacy Policy](https://botkube.io/privacy-policy).
   disable: false
 
-## Parameters for the config watcher container.
+# -- Parameters for the Config Watcher component which reloads Botkube on ConfigMap changes.
+# It restarts Botkube when configuration data change is detected. It watches ConfigMaps and/or Secrets with the `botkube.io/config-watch: "true"` label from the namespace where Botkube is installed.
 configWatcher:
   # -- If true, restarts the Botkube Pod on config changes.
   enabled: true
-  # -- Directory, where watched configuration resources are stored.
-  tmpDir: "/tmp/watched-cfg/"
-  # -- Timeout for the initial Config Watcher sync.
-  # If set to 0, waiting for Config Watcher sync will be skipped. In a result, configuration changes may not reload Botkube app during the first few seconds after Botkube startup.
-  initialSyncTimeout: 0
-  image:
-    # -- Config watcher image registry.
-    registry: ghcr.io
-    # -- Config watcher image repository.
-    repository: kubeshop/k8s-sidecar # kiwigrid/k8s-sidecar:1.19.5 - see https://github.com/kubeshop/k8s-sidecar/pull/1
-    # -- Config watcher image tag.
-    tag: ignore-initial-events
-    # -- Config watcher image pull policy.
-    pullPolicy: IfNotPresent
+  # -- In-cluster Config Watcher configuration. It is used when remote configuration is not provided.
+  inCluster:
+    # -- Resync period for the Config Watcher informers.
+    informerResyncPeriod: 10m
 
 # -- Configuration for Botkube executors and sources plugins.
 plugins:
   # -- Directory, where downloaded plugins are cached.
   cacheDir: "/tmp"
-  # -- List of plugins repositories.
+  # -- List of plugins repositories. Each repository defines the URL and optional `headers`
   repositories:
     # -- This repository serves officially supported Botkube plugins.
     botkube:
-      url: https://github.com/kubeshop/botkube/releases/download/v9.99.9-dev/plugins-index.yaml
+      url: https://github.com/kubeshop/botkube/releases/download/v1.14.0/plugins-index.yaml
+      # headers: {} # optional headers for plugins repository.
+    botkubeExtra:
+      url: https://github.com/kubeshop/botkube-plugins/releases/download/v1.14.0/plugins-index.yaml
 
-# -- Configuration for remote Botkube settings
+  # -- Configure Incoming webhook for source plugins.
+  incomingWebhook:
+    enabled: true
+    port: 2115
+    targetPort: 2115
+  # -- Botkube Restart Policy on plugin failure.
+  restartPolicy:
+    # -- Restart policy type. Allowed values: "RestartAgent", "DeactivatePlugin".
+    type: "DeactivatePlugin"
+    # -- Number of restarts before policy takes into effect.
+    threshold: 10
+  healthCheckInterval: 10s
+
+# -- Configuration for synchronizing Botkube configuration.
 config:
-  # -- Base provider definition
+  # -- Base provider definition.
   provider:
-    # -- Unique identifier for remote Botkube settings
+    # -- Unique identifier for remote Botkube settings.
+    # If set to an empty string, Botkube won't fetch remote configuration.
     identifier: ""
-    # -- Endpoint to fetch Botkube settings from
-    endpoint: ""
+    # -- Endpoint to fetch Botkube settings from.
+    endpoint: "https://api.botkube.io/graphql"
+    # -- Key passed as a `X-API-Key` header to the provider's endpoint.
+    apiKey: ""

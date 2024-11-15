@@ -3,14 +3,19 @@ package execute
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/sirupsen/logrus"
+	"github.com/slack-go/slack"
 	"google.golang.org/grpc/status"
-	"gopkg.in/yaml.v3"
+	"k8s.io/client-go/rest"
+	"sigs.k8s.io/yaml"
 
-	"github.com/kubeshop/botkube/internal/plugin"
+	"github.com/kubeshop/botkube/pkg/api"
 	"github.com/kubeshop/botkube/pkg/api/executor"
+	"github.com/kubeshop/botkube/pkg/bot/interactive"
 	"github.com/kubeshop/botkube/pkg/config"
+	"github.com/kubeshop/botkube/pkg/plugin"
 )
 
 // PluginExecutor provides functionality to run registered Botkube plugins.
@@ -18,14 +23,16 @@ type PluginExecutor struct {
 	log           logrus.FieldLogger
 	cfg           config.Config
 	pluginManager *plugin.Manager
+	restCfg       *rest.Config
 }
 
 // NewPluginExecutor creates a new instance of PluginExecutor.
-func NewPluginExecutor(log logrus.FieldLogger, cfg config.Config, manager *plugin.Manager) *PluginExecutor {
+func NewPluginExecutor(log logrus.FieldLogger, cfg config.Config, manager *plugin.Manager, restCfg *rest.Config) *PluginExecutor {
 	return &PluginExecutor{
 		log:           log,
 		cfg:           cfg,
 		pluginManager: manager,
+		restCfg:       restCfg,
 	}
 }
 
@@ -41,51 +48,239 @@ func (e *PluginExecutor) CanHandle(bindings []string, args []string) bool {
 	return len(plugins) > 0
 }
 
-// GetCommandPrefix gets verb command with k8s alias prefix.
+const multiWordArgPlaceholder = "{multi-word arg}"
+
+// GetCommandPrefix returns plugin name and the verb if present. If the verb is multi-word, it returns a placeholder for it.
 func (e *PluginExecutor) GetCommandPrefix(args []string) string {
-	if len(args) == 0 {
+	switch len(args) {
+	case 0:
 		return ""
+	case 1:
+		return args[0]
 	}
 
-	return args[0]
+	if strings.Contains(args[1], " ") {
+		return fmt.Sprintf("%s %s", args[0], multiWordArgPlaceholder)
+	}
+
+	return fmt.Sprintf("%s %s", args[0], args[1])
 }
 
 // Execute executes plugin executor based on a given command.
-func (e *PluginExecutor) Execute(ctx context.Context, bindings []string, args []string, command string) (string, error) {
+func (e *PluginExecutor) Execute(ctx context.Context, bindings []string, slackState *slack.BlockActionStates, cmdCtx CommandContext) (interactive.CoreMessage, error) {
 	e.log.WithFields(logrus.Fields{
 		"bindings": bindings,
-		"command":  command,
-	}).Debugf("Handling plugin command...")
+		"command":  cmdCtx.CleanCmd,
+	}).Debug("Handling plugin command...")
 
-	cmdName := args[0]
+	cmdName := cmdCtx.Args[0]
 	plugins, fullPluginName := e.getEnabledPlugins(bindings, cmdName)
 
 	configs, err := e.collectConfigs(plugins)
 	if err != nil {
-		return "", fmt.Errorf("while collecting configs: %w", err)
+		return interactive.CoreMessage{}, fmt.Errorf("while collecting configs: %w", err)
+	}
+
+	channel := cmdCtx.Conversation.DisplayName
+	if channel == "" {
+		channel = cmdCtx.Conversation.ID
+	}
+
+	input := plugin.KubeConfigInput{
+		Channel: channel,
+	}
+	e.log.WithField("input", input).Debug("Generating Kubeconfig...")
+
+	kubeconfig, err := plugin.GenerateKubeConfig(e.restCfg, e.cfg.Settings.ClusterName, plugins[0].Context, input)
+	if err != nil {
+		return interactive.CoreMessage{}, fmt.Errorf("while generating kube config: %w", err)
 	}
 
 	cli, err := e.pluginManager.GetExecutor(fullPluginName)
 	if err != nil {
-		return "", fmt.Errorf("while getting concrete plugin client: %w", err)
+		return interactive.CoreMessage{}, fmt.Errorf("while getting concrete plugin client: %w", err)
+	}
+
+	if slackState != nil {
+		e.sanitizeSlackStateIDs(slackState)
 	}
 
 	resp, err := cli.Execute(ctx, executor.ExecuteInput{
-		Command: command,
+		Command: cmdCtx.CleanCmd,
 		Configs: configs,
+		Context: executor.ExecuteInputContext{
+			IsInteractivitySupported: e.isInteractivitySupported(cmdCtx),
+			SlackState:               slackState,
+			KubeConfig:               kubeconfig,
+			Message: executor.Message{
+				Text: cmdCtx.Conversation.Text,
+				URL:  cmdCtx.Conversation.URL,
+				User: executor.User{
+					Mention:     cmdCtx.User.Mention,
+					DisplayName: cmdCtx.User.DisplayName,
+				},
+				ParentActivityID: cmdCtx.Conversation.ParentActivityID,
+			},
+			IncomingWebhook: executor.IncomingWebhookDetailsContext{
+				BaseSourceURL: e.cfg.Plugins.IncomingWebhook.InClusterBaseURL + "/sources/v1",
+			},
+		},
 	})
 	if err != nil {
 		s, ok := status.FromError(err)
 		if !ok {
-			return "", NewExecutionCommandError(err.Error())
+			return interactive.CoreMessage{}, NewExecutionCommandError(err.Error())
 		}
-		return "", NewExecutionCommandError(s.Message())
+		return interactive.CoreMessage{}, NewExecutionCommandError(s.Message())
 	}
 
-	return resp.Data, nil
+	if resp.Message.Type == api.SkipMessage && allMessagesMarkedAsSkip(resp.Messages) {
+		return interactive.CoreMessage{}, nil
+	}
+
+	if resp.Message.IsEmpty() && allMessagesAreEmpty(resp.Messages) {
+		return emptyMsg(cmdCtx), nil
+	}
+
+	if resp.Message.Type == api.BaseBodyWithFilterMessage {
+		return e.filterMessage(resp.Message, cmdCtx), nil
+	}
+
+	out := interactive.CoreMessage{
+		Message:  resp.Message,
+		Messages: resp.Messages,
+	}
+	if !resp.Message.OnlyVisibleForYou {
+		out.Description = header(cmdCtx)
+	}
+
+	return out, nil
 }
 
-func (e *PluginExecutor) collectConfigs(plugins []config.PluginExecutor) ([]*executor.Config, error) {
+func (e *PluginExecutor) isInteractivitySupported(cmdCtx CommandContext) bool {
+	// TODO(https://github.com/kubeshop/botkube-cloud/issues/645): add support for kubectl builder
+	if strings.EqualFold(cmdCtx.CleanCmd, "kubectl") && cmdCtx.Platform == config.CloudTeamsCommPlatformIntegration {
+		// event though the cloud Teams support some interactivity, we do not support the command builder yet.
+		return false
+	}
+	return cmdCtx.Platform.IsInteractive()
+}
+
+func allMessagesMarkedAsSkip(msgs []api.Message) bool {
+	for _, item := range msgs {
+		if item.Type != api.SkipMessage {
+			return false
+		}
+	}
+	return true
+}
+
+func allMessagesAreEmpty(msgs []api.Message) bool {
+	for _, item := range msgs {
+		if !item.IsEmpty() {
+			return false
+		}
+	}
+	return true
+}
+
+// sanitizeSlackStateIDs makes sure that the slack state doesn't contain the --cluster-name
+// in the ids. Example state before sanitizing:
+//
+//	Values: map[string]map[string]slack.BlockAction{
+//	  "6f79d399-e607-4744-80e8-6eb8e5a7743e": map[string]slack.BlockAction{
+//	    "kubectl @builder --resource-type --cluster-name=`"stage\"": slack.BlockAction{}
+//	  }
+//	}
+func (e *PluginExecutor) sanitizeSlackStateIDs(slackState *slack.BlockActionStates) {
+	flag := fmt.Sprintf("--cluster-name=%q ", e.cfg.Settings.ClusterName)
+
+	for id, blocks := range slackState.Values {
+		updated := make(map[string]slack.BlockAction, len(blocks))
+		for id, act := range blocks {
+			cleanID := strings.ReplaceAll(id, flag, "")
+			act.Value = strings.ReplaceAll(act.Value, flag, "")
+			act.SelectedOption.Value = strings.ReplaceAll(act.SelectedOption.Value, flag, "")
+			act.ActionID = strings.ReplaceAll(act.ActionID, flag, "")
+			act.BlockID = strings.ReplaceAll(act.BlockID, flag, "")
+			updated[cleanID] = act
+		}
+
+		delete(slackState.Values, id)
+		cleanID := strings.ReplaceAll(id, flag, "")
+		slackState.Values[cleanID] = updated
+	}
+}
+
+func (e *PluginExecutor) Help(ctx context.Context, bindings []string, cmdCtx CommandContext) (interactive.CoreMessage, error) {
+	e.log.WithFields(logrus.Fields{
+		"bindings": bindings,
+		"command":  cmdCtx.CleanCmd,
+	}).Debugf("Handling plugin help command...")
+
+	cmdName := cmdCtx.Args[0]
+	_, fullPluginName := e.getEnabledPlugins(bindings, cmdName)
+
+	cli, err := e.pluginManager.GetExecutor(fullPluginName)
+	if err != nil {
+		return interactive.CoreMessage{}, fmt.Errorf("while getting concrete plugin client: %w", err)
+	}
+	e.log.Debug("running help command")
+
+	msg, err := cli.Help(ctx)
+	if err != nil {
+		return interactive.CoreMessage{}, err
+	}
+
+	if msg.IsEmpty() {
+		return emptyMsg(cmdCtx), nil
+	}
+
+	if msg.Type == api.BaseBodyWithFilterMessage {
+		return e.filterMessage(msg, cmdCtx), nil
+	}
+
+	return interactive.CoreMessage{
+		Description: header(cmdCtx),
+		Message:     msg,
+	}, nil
+}
+
+func emptyMsg(cmdCtx CommandContext) interactive.CoreMessage {
+	return interactive.CoreMessage{
+		Description: header(cmdCtx),
+		Message: api.Message{
+			BaseBody: api.Body{
+				Plaintext: emptyResponseMsg,
+			},
+		},
+	}
+}
+
+// filterMessage takes into account only base plaintext + code block, all other properties are ignored.
+// This method should be called only for message type api.BaseBodyWithFilterMessage.
+func (e *PluginExecutor) filterMessage(msg api.Message, cmdCtx CommandContext) interactive.CoreMessage {
+	code := cmdCtx.ExecutorFilter.Apply(msg.BaseBody.CodeBlock)
+	plaintext := cmdCtx.ExecutorFilter.Apply(msg.BaseBody.Plaintext)
+	if code == "" && plaintext == "" {
+		plaintext = emptyResponseMsg
+	}
+
+	outMsg := interactive.CoreMessage{
+		Description: header(cmdCtx),
+		Message: api.Message{
+			BaseBody: api.Body{
+				Plaintext: plaintext,
+				CodeBlock: code,
+			},
+		},
+	}
+
+	allLines := code + plaintext
+	return appendInteractiveFilterIfNeeded(allLines, outMsg, cmdCtx)
+}
+
+func (e *PluginExecutor) collectConfigs(plugins []config.Plugin) ([]*executor.Config, error) {
 	var configs []*executor.Config
 
 	for _, plugin := range plugins {
@@ -108,9 +303,9 @@ func (e *PluginExecutor) collectConfigs(plugins []config.PluginExecutor) ([]*exe
 	return configs, nil
 }
 
-func (e *PluginExecutor) getEnabledPlugins(bindings []string, cmdName string) ([]config.PluginExecutor, string) {
+func (e *PluginExecutor) getEnabledPlugins(bindings []string, cmdName string) ([]config.Plugin, string) {
 	var (
-		out            []config.PluginExecutor
+		out            []config.Plugin
 		fullPluginName string
 	)
 

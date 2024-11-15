@@ -5,14 +5,7 @@ import (
 	"errors"
 
 	"github.com/kubeshop/botkube/pkg/config"
-	"github.com/kubeshop/botkube/pkg/execute/command"
 )
-
-type fakeAnalyticsReporter struct{}
-
-func (f *fakeAnalyticsReporter) ReportCommand(_ config.CommPlatformIntegration, _ string, _ command.Origin, _ bool) error {
-	return nil
-}
 
 type fakeCfgPersistenceManager struct {
 	expectedAlias string
@@ -29,10 +22,6 @@ func (f *fakeCfgPersistenceManager) PersistNotificationsEnabled(ctx context.Cont
 	if f.expectedAlias != channelAlias {
 		return errors.New("different alias")
 	}
-	return nil
-}
-
-func (f *fakeCfgPersistenceManager) PersistFilterEnabled(ctx context.Context, name string, enabled bool) error {
 	return nil
 }
 

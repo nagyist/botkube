@@ -2,9 +2,13 @@ package interactive
 
 import (
 	"fmt"
+	"os"
 
+	"golang.org/x/exp/slices"
+
+	"github.com/kubeshop/botkube/internal/config/remote"
+	"github.com/kubeshop/botkube/pkg/api"
 	"github.com/kubeshop/botkube/pkg/config"
-	formatx "github.com/kubeshop/botkube/pkg/format"
 )
 
 // RunCommandName defines the button name for the run commands.
@@ -12,19 +16,16 @@ const RunCommandName = "Run command"
 
 // HelpMessage provides an option to build the Help message depending on a given platform.
 type HelpMessage struct {
-	btnBuilder             ButtonBuilder
-	botName                string
+	btnBuilder             *api.ButtonBuilder
 	platform               config.CommPlatformIntegration
 	clusterName            string
 	enabledPluginExecutors []string
 }
 
 // NewHelpMessage return a new instance of HelpMessage.
-func NewHelpMessage(platform config.CommPlatformIntegration, clusterName, botName string, executors []string) *HelpMessage {
-	btnBuilder := ButtonBuilder{BotName: botName}
+func NewHelpMessage(platform config.CommPlatformIntegration, clusterName string, executors []string) *HelpMessage {
 	return &HelpMessage{
-		btnBuilder:             btnBuilder,
-		botName:                botName,
+		btnBuilder:             api.NewMessageButtonBuilder(),
 		platform:               platform,
 		clusterName:            clusterName,
 		enabledPluginExecutors: executors,
@@ -32,24 +33,24 @@ func NewHelpMessage(platform config.CommPlatformIntegration, clusterName, botNam
 }
 
 // Build returns help message with interactive sections.
-func (h *HelpMessage) Build() Message {
-	msg := Message{
-		Base: Base{
-			Description: fmt.Sprintf("Botkube is now active for %q cluster :rocket:", h.clusterName),
-		},
+//
+// You can see how the help message looks like without starting the Agent - navigate to `test/msg-layouts/help_test.go`.
+func (h *HelpMessage) Build(init bool) CoreMessage {
+	msg := CoreMessage{}
+
+	if init {
+		msg.Header = fmt.Sprintf("🚀 Botkube instance %q is now active.", h.clusterName)
 	}
 
-	type getter func() []Section
-	var sections = []getter{
-		h.cluster,
-		h.ping,
+	type getter func() []api.Section
+	sections := []getter{
+		h.botkubeCloud,
+		h.aiPlugin,
+		h.basicCommands,
 		h.notificationSections,
-		h.actionSections,
-		h.configSections,
-		h.kubectlSections,
 		h.pluginHelpSections,
-		h.filters,
-		h.feedback,
+		h.cluster,
+		h.advancedFeatures,
 		h.footer,
 	}
 	for _, add := range sections {
@@ -59,17 +60,27 @@ func (h *HelpMessage) Build() Message {
 	return msg
 }
 
-func (h *HelpMessage) cluster() []Section {
+func (h *HelpMessage) cluster() []api.Section {
 	switch h.platform {
-	case config.SlackCommPlatformIntegration, config.DiscordCommPlatformIntegration, config.MattermostCommPlatformIntegration:
-		return []Section{
+	case config.DiscordCommPlatformIntegration, config.MattermostCommPlatformIntegration:
+		return []api.Section{
 			{
-				Base: Base{
-					Header:      "Using multiple instances",
-					Description: fmt.Sprintf("If you are running multiple Botkube instances in the same channel to interact with %s, make sure to specify the cluster name when typing commands.", h.clusterName),
-					Body: Body{
+				Base: api.Base{
+					Header:      "Multi-cluster mode",
+					Description: "If you have multiple clusters configured for this channel, specify the cluster name when typing commands.",
+					Body: api.Body{
 						CodeBlock: fmt.Sprintf("--cluster-name=%s\n", h.clusterName),
 					},
+				},
+			},
+		}
+	case config.CloudSlackCommPlatformIntegration, config.CloudTeamsCommPlatformIntegration:
+		return []api.Section{
+			{
+				Base: api.Base{
+					Header: "🏁 Multi-Cluster flags",
+					Description: fmt.Sprintf("`--cluster-name=%q` flag to run a command on this cluster\n", h.clusterName) +
+						"`--all-clusters` flag to run commands on all clusters",
 				},
 			},
 		}
@@ -78,193 +89,144 @@ func (h *HelpMessage) cluster() []Section {
 	}
 }
 
-func (h *HelpMessage) ping() []Section {
-	return []Section{
+func (h *HelpMessage) basicCommands() []api.Section {
+	return []api.Section{
 		{
-			Base: Base{
-				Header:      "Ping your cluster",
-				Description: "Check the status of connected Kubernetes cluster(s).",
+			Base: api.Base{
+				Header: "🛠️ Basic commands",
+				Description: fmt.Sprintf("`%s ping` - ping your cluster and check its status\n", api.MessageBotNamePlaceholder) +
+					fmt.Sprintf("`%s list [source|executor|action|alias]` - list available plugins and features", api.MessageBotNamePlaceholder),
 			},
-			Buttons: []Button{
-				h.btnBuilder.ForCommandWithDescCmd("Check status", "ping"),
+			Buttons: []api.Button{
+				h.btnBuilder.ForCommandWithoutDesc("Ping cluster", "ping"),
+				h.btnBuilder.ForCommandWithoutDesc("List source plugins", "list sources"),
+				h.btnBuilder.ForCommandWithoutDesc("List executor plugins", "list executors"),
 			},
 		},
 	}
 }
 
-func (h *HelpMessage) filters() []Section {
-	return []Section{
-		{
-			Base: Base{
-				Header: "Filters (advanced)",
-				Body: Body{
-					Plaintext: "You can extend Botkube functionality by writing additional filters that can check resource specs, validate some checks and add messages to the Event struct. Learn more at https://docs.botkube.io/filters",
-				},
-			},
-		},
+func (h *HelpMessage) footer() []api.Section {
+	btns := api.Buttons{
+		h.btnBuilder.ForURL("Give feedback", "https://feedback.botkube.io", api.ButtonStylePrimary),
+		h.btnBuilder.ForURL("Read our docs", "https://docs.botkube.io"),
 	}
-}
 
-func (h *HelpMessage) feedback() []Section {
-	return []Section{
-		{
-			Base: Base{
-				Header: "Angry? Amazed?",
-			},
-			Buttons: []Button{
-				h.btnBuilder.DescriptionURL("Give feedback", "feedback", "https://feedback.botkube.io", ButtonStylePrimary),
-			},
-		},
+	if h.platform == config.CloudSlackCommPlatformIntegration || h.platform == config.CloudTeamsCommPlatformIntegration {
+		btns = append(btns, h.btnBuilder.ForURL("Get support", "https://botkube.io/support"))
+	} else {
+		btns = append(btns, h.btnBuilder.ForURL("Join our Slack", "https://join.botkube.io"))
 	}
-}
 
-func (h *HelpMessage) footer() []Section {
-	return []Section{
-		{
-			Buttons: []Button{
-				h.btnBuilder.ForURL("Read our docs", "https://docs.botkube.io"),
-				h.btnBuilder.ForURL("Join our Slack", "https://join.botkube.io"),
-				h.btnBuilder.ForURL("Follow us on Twitter", "https://twitter.com/botkube_io"),
-			},
-		},
-	}
-}
+	btns = append(btns, h.btnBuilder.ForURL("Follow us on Twitter/X", "https://twitter.com/botkube_io"))
 
-func (h *HelpMessage) notificationSections() []Section {
-	return []Section{
-		{
-			Base: Base{
-				Header: "Manage incoming notifications",
-				Body: Body{
-					CodeBlock: fmt.Sprintf("%s [enable|disable|status] notifications\n", h.botName),
-				},
-			},
-			Buttons: []Button{
-				h.btnBuilder.ForCommandWithoutDesc("Enable notifications", "enable notifications"),
-				h.btnBuilder.ForCommandWithoutDesc("Disable notifications", "disable notifications"),
-				h.btnBuilder.ForCommandWithoutDesc("Get status", "status notifications"),
-			},
-		},
-		{
-			Base: Base{
-				Header:      "Notification settings for this channel",
-				Description: "By default, Botkube will notify only about cluster errors and recommendations.",
-			},
-			Buttons: []Button{
-				h.btnBuilder.ForCommandWithDescCmd("Adjust notifications", "edit SourceBindings", ButtonStylePrimary),
-			},
-		},
-	}
-}
-
-func (h *HelpMessage) actionSections() []Section {
-	return []Section{
-		{
-			Base: Base{
-				Header: "Manage automated actions",
-				Body: Body{
-					CodeBlock: fmt.Sprintf("%s [list|enable|disable] action [action name]\n", h.botName),
-				},
-			},
-			Buttons: []Button{
-				h.btnBuilder.ForCommandWithoutDesc("List available actions", "list actions"),
-			},
-		},
-	}
-}
-
-func (h *HelpMessage) configSections() []Section {
-	return []Section{
-		{
-			Base: Base{
-				Header: "View current Botkube configuration",
-				Body: Body{
-					CodeBlock: fmt.Sprintf("%s config\n", h.botName),
-				},
-			},
-			Buttons: []Button{
-				h.btnBuilder.ForCommandWithoutDesc("Display configuration", "config"),
-			},
-		},
-	}
-}
-
-func (h *HelpMessage) kubectlSections() []Section {
-	// TODO(https://github.com/kubeshop/botkube/issues/802): remove this warning in after releasing 0.17.
-	warn := ":warning: Botkube 0.17 and above require a prefix (`k`, `kc`, `kubectl`) when running kubectl commands through the bot.\n\ne.g. `@Botkube k get pods` instead of `@Botkube get pods`\n"
-
-	if h.platform == config.SocketSlackCommPlatformIntegration {
-		return []Section{
+	if !remote.IsEnabled() {
+		return []api.Section{
 			{
-				Base: Base{
-					Header:      "Interactive kubectl - no typing!",
-					Description: warn,
-				},
-			},
-			{
-				Base: Base{
-					Description: "Build kubectl commands interactively",
-				},
-				Buttons: []Button{
-					h.btnBuilder.ForCommandWithDescCmd("kubectl", "kubectl", ButtonStylePrimary),
-				},
-				Context: ContextItems{
-					{
-						Text: "Alternatively use kubectl as usual with all supported commands\n" +
-							"`k | kc | kubectl [verb] [resource] [flags]`",
-					},
-				},
-			},
-			{
-				Base: Base{
-					Description: "To list all enabled executors",
-				},
-				Buttons: []Button{
-					h.btnBuilder.ForCommandWithDescCmd("List executors", "list executors"),
-				},
+				Buttons: btns,
 			},
 		}
 	}
 
-	// without the kubectl command builder
-	return []Section{
+	return []api.Section{
 		{
-			Base: Base{
-				Header:      "Run kubectl commands (if enabled)",
-				Description: fmt.Sprintf("%s\nYou can run kubectl commands directly from %s!", warn, formatx.ToTitle(h.platform)),
-			},
-			Buttons: []Button{
-				h.btnBuilder.ForCommandWithDescCmd(RunCommandName, "kubectl get services"),
-				h.btnBuilder.ForCommandWithDescCmd(RunCommandName, "kubectl get pods"),
-				h.btnBuilder.ForCommandWithDescCmd(RunCommandName, "kubectl get deployments"),
+			Context: api.ContextItems{
+				{Text: fmt.Sprintf("👀 _All %s mentions and events are visible to your Botkube Cloud organisation’s administrators._", api.MessageBotNamePlaceholder)},
 			},
 		},
 		{
-			Base: Base{
-				Description: "To list all enabled executors",
+			Style: api.SectionStyle{
+				Divider: api.DividerStyleTopNone,
 			},
-			Buttons: []Button{
-				h.btnBuilder.ForCommandWithDescCmd("List executors", "list executors"),
-			},
+			Buttons: btns,
 		},
 	}
 }
 
-func (h *HelpMessage) pluginHelpSections() []Section {
-	var out []Section
+func (h *HelpMessage) notificationSections() []api.Section {
+	btns := api.Buttons{
+		h.btnBuilder.ForCommandWithoutDesc("Enable", "enable notifications"),
+		h.btnBuilder.ForCommandWithoutDesc("Disable", "disable notifications"),
+		h.btnBuilder.ForCommandWithoutDesc("Get status", "status notifications"),
+	}
+	instanceID := os.Getenv(remote.ProviderIdentifierEnvKey)
+	if instanceID != "" {
+		instanceViewURL := fmt.Sprintf("https://app.botkube.io/instances/%s", instanceID)
+		btns = append(btns, h.btnBuilder.ForURL("Change notification on Cloud", instanceViewURL, api.ButtonStylePrimary))
+	}
+	return []api.Section{
+		{
+			Base: api.Base{
+				Header: "📣 Notifications",
+				Description: fmt.Sprintf("`%s [enable|disable|status] notifications` - set or query your notification status\n", api.MessageBotNamePlaceholder) +
+					fmt.Sprintf("`%s edit sourcebindings` - select notification sources for this channel", api.MessageBotNamePlaceholder),
+			},
+			Buttons: btns,
+		},
+	}
+}
+
+func (h *HelpMessage) pluginHelpSections() []api.Section {
+	var out []api.Section
+
+	slices.Sort(h.enabledPluginExecutors) // to make the order predictable for testing
+
 	for _, name := range h.enabledPluginExecutors {
 		helpFn, found := pluginHelpProvider[name]
 		if !found {
 			continue
 		}
 
-		platformName := h.platform
-		if h.platform == config.SocketSlackCommPlatformIntegration {
-			platformName = "slack" // normalize the SocketSlack to Slack
-		}
-
-		helpSection := helpFn(formatx.ToTitle(platformName), h.btnBuilder)
+		helpSection := helpFn(h.platform, h.btnBuilder)
 		out = append(out, helpSection)
 	}
 	return out
+}
+
+func (h *HelpMessage) botkubeCloud() []api.Section {
+	if !remote.IsEnabled() {
+		return nil
+	}
+	return []api.Section{
+		{
+			Base: api.Base{
+				Header: "☁️ Botkube Cloud",
+			},
+			Buttons: []api.Button{
+				h.btnBuilder.ForCommandWithDescCmd("List connected instances", "cloud list instances"),
+				h.btnBuilder.ForCommandWithDescCmd("Set channel default cluster", "cloud set default-instance"),
+				h.btnBuilder.ForURL("Open Botkube Cloud", "https://app.botkube.io", api.ButtonStylePrimary),
+			},
+		},
+	}
+}
+
+func (h *HelpMessage) aiPlugin() []api.Section {
+	if !remote.IsEnabled() {
+		return nil
+	}
+	return []api.Section{
+		{
+			Base: api.Base{
+				Header:      "🤖 AI powered Kubernetes assistant",
+				Description: fmt.Sprintf("`%s ai` use natural language to ask any questions\n`%s ai scan` perform a cluster-wide scan for issues", api.MessageBotNamePlaceholder, api.MessageBotNamePlaceholder),
+			},
+			Buttons: []api.Button{
+				h.btnBuilder.ForCommandWithoutDesc("Cluster Scan", "ai scan", api.ButtonStylePrimary),
+			},
+		},
+	}
+}
+
+func (h *HelpMessage) advancedFeatures() []api.Section {
+	return []api.Section{
+		{
+			Base: api.Base{
+				Header: "Other features",
+			},
+			Buttons: []api.Button{
+				h.btnBuilder.ForURLWithTextDesc("Automation", "Automate your workflows by executing custom commands based on specific events", "https://docs.botkube.io/usage/automated-actions", api.ButtonStylePrimary),
+			},
+		},
+	}
 }

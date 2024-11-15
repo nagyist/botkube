@@ -11,9 +11,9 @@ import (
 	sprig "github.com/go-task/slim-sprig"
 	"github.com/sirupsen/logrus"
 
+	"github.com/kubeshop/botkube/pkg/api"
 	"github.com/kubeshop/botkube/pkg/bot/interactive"
 	"github.com/kubeshop/botkube/pkg/config"
-	"github.com/kubeshop/botkube/pkg/event"
 	"github.com/kubeshop/botkube/pkg/execute"
 	"github.com/kubeshop/botkube/pkg/execute/command"
 	"github.com/kubeshop/botkube/pkg/multierror"
@@ -21,12 +21,16 @@ import (
 )
 
 const (
-	// universalBotNamePlaceholder is a cross-platform placeholder for bot name in commands.
-	universalBotNamePlaceholder = "{{BotName}}"
-
 	// unknownValue defines an unknown string value.
-	unknownValue = "unknown"
+	unknownValue = "n/a"
 )
+
+// Action describes an automated action for a given event.
+type Action struct {
+	Command          string
+	ExecutorBindings []string
+	DisplayName      string
+}
 
 // ExecutorFactory facilitates creation of execute.Executor instances.
 type ExecutorFactory interface {
@@ -45,9 +49,9 @@ func NewProvider(log logrus.FieldLogger, cfg config.Actions, executorFactory Exe
 	return &Provider{log: log, cfg: cfg, executorFactory: executorFactory}
 }
 
-// RenderedActionsForEvent finds and processes actions for given event.
-func (p *Provider) RenderedActionsForEvent(e event.Event, sourceBindings []string) ([]event.Action, error) {
-	var actions []event.Action
+// RenderedActions finds and processes actions for given data.
+func (p *Provider) RenderedActions(e any, sourceBindings []string) ([]Action, error) {
+	var actions []Action
 	errs := multierror.New()
 	for _, action := range p.cfg {
 		if !action.Enabled {
@@ -70,9 +74,9 @@ func (p *Provider) RenderedActionsForEvent(e event.Event, sourceBindings []strin
 
 		p.log.Debugf("Rendered command: %q", renderedCmd)
 
-		actions = append(actions, event.Action{
+		actions = append(actions, Action{
 			DisplayName:      action.DisplayName,
-			Command:          fmt.Sprintf("%s %s", universalBotNamePlaceholder, renderedCmd),
+			Command:          fmt.Sprintf("%s %s", api.MessageBotNamePlaceholder, renderedCmd),
 			ExecutorBindings: action.Bindings.Executors,
 		})
 	}
@@ -80,12 +84,12 @@ func (p *Provider) RenderedActionsForEvent(e event.Event, sourceBindings []strin
 	return actions, errs.ErrorOrNil()
 }
 
-// ExecuteEventAction executes action for given event.
-// WARNING: The result interactive.Message contains BotNamePlaceholder, which should be replaced before sending the message.
-func (p *Provider) ExecuteEventAction(ctx context.Context, action event.Action) interactive.GenericMessage {
+// ExecuteAction executes action for given event.
+func (p *Provider) ExecuteAction(ctx context.Context, action Action) interactive.CoreMessage {
+	userName := fmt.Sprintf("Automation %q", action.DisplayName)
 	e := p.executorFactory.NewDefault(execute.NewDefaultInput{
 		Conversation: execute.Conversation{
-			IsAuthenticated:  true,
+			IsKnown:          true,
 			ExecutorBindings: action.ExecutorBindings,
 			CommandOrigin:    command.AutomationOrigin,
 			Alias:            unknownValue,
@@ -94,16 +98,19 @@ func (p *Provider) ExecuteEventAction(ctx context.Context, action event.Action) 
 		CommGroupName:   unknownValue,
 		Platform:        unknownValue,
 		NotifierHandler: &universalNotifierHandler{},
-		Message:         strings.TrimSpace(strings.TrimPrefix(action.Command, universalBotNamePlaceholder)),
-		User:            fmt.Sprintf("Automation %q", action.DisplayName),
+		Message:         strings.TrimSpace(strings.TrimPrefix(action.Command, api.MessageBotNamePlaceholder)),
+		User: execute.UserInput{
+			Mention:     userName,
+			DisplayName: userName,
+		},
 	})
 	response := e.Execute(ctx)
 
-	return &genericMessage{response: response}
+	return response
 }
 
 type renderingData struct {
-	Event event.Event
+	Event any
 }
 
 func (p *Provider) renderActionCommand(action config.Action, data renderingData) (string, error) {
@@ -122,16 +129,6 @@ func (p *Provider) renderActionCommand(action config.Action, data renderingData)
 	return result.String(), nil
 }
 
-type genericMessage struct {
-	response interactive.Message
-}
-
-// ForBot returns message prepared for a bot with a given name.
-func (g *genericMessage) ForBot(botName string) interactive.Message {
-	g.response.ReplaceBotNameInCommands(universalBotNamePlaceholder, botName)
-	return g.response
-}
-
 type universalNotifierHandler struct{}
 
 func (n *universalNotifierHandler) NotificationsEnabled(_ string) bool {
@@ -140,8 +137,4 @@ func (n *universalNotifierHandler) NotificationsEnabled(_ string) bool {
 
 func (n *universalNotifierHandler) SetNotificationsEnabled(_ string, _ bool) error {
 	return errors.New("setting notification from automated action is not supported. Use Botkube commands on a specific channel to set notifications")
-}
-
-func (n *universalNotifierHandler) BotName() string {
-	return universalBotNamePlaceholder
 }

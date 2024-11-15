@@ -1,11 +1,12 @@
 <p align="center">
-  <img src="./docs/assets/botkube-title.png" alt="Botkube Logo Light" />
+  <a href="https://botkube.io">
+    <img src="./docs/assets/botkube-title.png" alt="Botkube Logo Light" />
+  </a>
 </p>
 
 <p align="center">
   Botkube is a messaging bot for monitoring and debugging Kubernetes clusters.
 </p>
-
 
 <p align="center">
   <a href="https://github.com/kubeshop/botkube/releases/latest">
@@ -27,9 +28,9 @@
 
 ## Overview
 
-Botkube helps you monitor your Kubernetes cluster, debug critical deployments and gives recommendations for standard practices by running checks on the Kubernetes resources. It integrates with multiple communication platforms, such as [Slack](https://slack.com), [Discord](https://discord.com/), or [Mattermost](https://mattermost.com).
+Botkube is a troubleshooting and monitoring solution that empowers DevOps teams to work more efficiently, enables developers to troubleshoot their applications without special Kubernetes access or knowledge, and improves reliability by delivering timely, context-enhanced notifications about events in your Kubernetes environments. It integrates with multiple communication platforms, such as [Slack](https://docs.botkube.io/installation/slack/), [Discord](https://docs.botkube.io/installation/discord/), or [Mattermost](https://docs.botkube.io/installation/mattermost/). Botkube monitors events from various sources, allows you to securely run commands, and run automated actions triggered by any of the [plugins Botkube supports](https://docs.botkube.io/plugins/) or your [own custom plugins](https://docs.botkube.io/plugins/development/).
 
-You can also execute `kubectl` commands on K8s cluster via Botkube which helps debugging an application or cluster.
+You can also execute `kubectl`, `helm` and other commands on your K8s, which helps debugging an application or cluster.
 
 <p align="center">
 <img src="./docs/assets/main-demo.gif" />
@@ -37,51 +38,28 @@ You can also execute `kubectl` commands on K8s cluster via Botkube which helps d
 
 ## Getting started
 
-Please follow [this](https://docs.botkube.io/installation/) for a complete Botkube installation guide.
-
-## Documentation
-
-For full documentation, visit [botkube.io](https://docs.botkube.io). The documentation sources reside on the [botkube-docs](https://github.com/kubeshop/botkube-docs) repository under **content** directory.
+Follow [the official Botkube installation guide](https://docs.botkube.io/installation/) to get started.
 
 ## Features
 
-<img src="./docs/assets/icons/terminal-box-line.svg" width="12%" align="right"/>
+### 💬 Connect to your clusters from anywhere at any time
 
-### Execute `kubectl` commands
+Botkube integrates with all common messaging platforms including:
+- Slack
+- Discord
+- Mattermost
 
-The same `kubectl` capabilities inside your favorite communicator. You do not have to learn anything new! Plus, you can configure which `kubectl` commands Botkube can execute. See [configuration](https://docs.botkube.io/configuration/) for details.
+### 💡 Elevate your troubleshooting workflow with intelligent insights
 
-<br /><br />
+Supercharge your technical workflow with our seamless alert consolidation and filtering. Gain automated intelligent insights to troubleshoot with precision and efficiency. Get alerted by Kubernetes, Prometheus, and other tools.
 
-<img src="./docs/assets/icons/question-answer-line.svg" width="10%" align="left"/>
+### 🚀 See alerts, Take action
 
-### Use multiple communication platforms
+Take your ChatOps experience to new heights and go beyond just monitoring. Seamlessly take action on your clusters with ease and efficiency. Access tools like `kubectl` and `helm` right from your collaboration workspace. Collaborate with other team members in real time.
 
-Botkube integrates with Slack, Discord, Mattermost, Microsoft Teams, ElasticSearch and outgoing webhook. See [configuration](https://docs.botkube.io/configuration/communication/) syntax for details.
+## Documentation
 
-<br /><br />
-
-<img src="./docs/assets/icons/stack-line.svg" width="13%" align="right"/>
-
-### Monitor any Kubernetes resource
-
-Botkube supports literally any Kubernetes resource, including Custom Resources. For example, if you use [`cert-manager`](https://cert-manager.io/), you can get alerted about certificate issue, or backup failure in case you use backup tools like [Velero](https://velero.io/) or [Kanister](https://kanister.io/).
-
-<br /><br />
-
-<img src="./docs/assets/icons/bug-line.svg" width="12%" align="left"/>
-
-### Debug anywhere, anytime
-
-Using Botkube you can debug your apps deployed on Kubernetes from anywhere. To extract crucial information from the cluster, you can even use mobile communicator apps, like Slack. The entire team can see what steps have already been taken and avoid duplicated work.
-
-<br /><br />
-
-<img src="./docs/assets/icons/cloud-line.svg" width="12%" align="right"/>
-
-### Deploy on any Kubernetes cluster
-
-You can deploy Botkube backend on any Kubernetes cluster. It doesn't matter whether it is [K3d](https://k3d.io), managed Kubernetes on a cloud provider, or bare-metal one.
+For full documentation, visit [docs.botkube.io](https://docs.botkube.io). The documentation sources reside on the [botkube-docs](https://github.com/kubeshop/botkube-docs) repository.
 
 ## Licence
 

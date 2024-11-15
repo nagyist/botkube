@@ -4,16 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
 	"sync"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/sirupsen/logrus"
+	"github.com/sourcegraph/conc/pool"
 
+	"github.com/kubeshop/botkube/internal/health"
+	"github.com/kubeshop/botkube/pkg/api"
 	"github.com/kubeshop/botkube/pkg/bot/interactive"
 	"github.com/kubeshop/botkube/pkg/config"
-	"github.com/kubeshop/botkube/pkg/event"
+	conversationx "github.com/kubeshop/botkube/pkg/conversation"
 	"github.com/kubeshop/botkube/pkg/execute"
 	"github.com/kubeshop/botkube/pkg/execute/command"
 	"github.com/kubeshop/botkube/pkg/multierror"
@@ -27,9 +31,6 @@ import (
 var _ Bot = &Discord{}
 
 const (
-	// customTimeFormat holds custom time format string.
-	customTimeFormat = "2006-01-02T15:04:05Z"
-
 	// discordBotMentionRegexFmt supports also nicknames (the exclamation mark).
 	// Read more: https://discordjs.guide/miscellaneous/parsing-mention-arguments.html#how-discord-mentions-work
 	discordBotMentionRegexFmt = "^<@!?%s>"
@@ -38,28 +39,25 @@ const (
 	discordMaxMessageSize = 2000
 )
 
-var embedColor = map[config.Level]int{
-	config.Info:     8311585,  // green
-	config.Warn:     16312092, // yellow
-	config.Debug:    8311585,  // green
-	config.Error:    13632027, // red
-	config.Critical: 13632027, // red
-}
-
 // Discord listens for user's message, execute commands and sends back the response.
 type Discord struct {
-	log             logrus.FieldLogger
-	executorFactory ExecutorFactory
-	reporter        AnalyticsReporter
-	api             *discordgo.Session
-	notification    config.Notification
-	botID           string
-	channelsMutex   sync.RWMutex
-	channels        map[string]channelConfigByID
-	notifyMutex     sync.Mutex
-	botMentionRegex *regexp.Regexp
-	commGroupName   string
-	mdFormatter     interactive.MDFormatter
+	log                   logrus.FieldLogger
+	executorFactory       ExecutorFactory
+	reporter              AnalyticsReporter
+	api                   *discordgo.Session
+	botID                 string
+	channelsMutex         sync.RWMutex
+	channels              map[string]channelConfigByID
+	notifyMutex           sync.Mutex
+	botMentionRegex       *regexp.Regexp
+	commGroupMetadata     CommGroupMetadata
+	renderer              *DiscordRenderer
+	messages              chan discordMessage
+	discordMessageWorkers *pool.Pool
+	shutdownOnce          sync.Once
+	status                health.PlatformStatusMsg
+	failureReason         health.FailureReasonMsg
+	errorMsg              string
 }
 
 // discordMessage contains message details to execute command and send back the result.
@@ -68,7 +66,7 @@ type discordMessage struct {
 }
 
 // NewDiscord creates a new Discord instance.
-func NewDiscord(log logrus.FieldLogger, commGroupName string, cfg config.Discord, executorFactory ExecutorFactory, reporter AnalyticsReporter) (*Discord, error) {
+func NewDiscord(log logrus.FieldLogger, commGroupMetadata CommGroupMetadata, cfg config.Discord, executorFactory ExecutorFactory, reporter AnalyticsReporter) (*Discord, error) {
 	botMentionRegex, err := discordBotMentionRegex(cfg.BotID)
 	if err != nil {
 		return nil, err
@@ -79,95 +77,82 @@ func NewDiscord(log logrus.FieldLogger, commGroupName string, cfg config.Discord
 		return nil, fmt.Errorf("while creating Discord session: %w", err)
 	}
 
-	channelsCfg := discordChannelsConfigFrom(cfg.Channels)
+	channelsCfg, err := discordChannelsConfigFrom(log, api, cfg.Channels)
+	if err != nil {
+		return nil, fmt.Errorf("while creating Discord channels config: %w", err)
+	}
 
 	return &Discord{
-		log:             log,
-		reporter:        reporter,
-		executorFactory: executorFactory,
-		api:             api,
-		botID:           cfg.BotID,
-		notification:    cfg.Notification,
-		commGroupName:   commGroupName,
-		channels:        channelsCfg,
-		botMentionRegex: botMentionRegex,
-		mdFormatter:     interactive.DefaultMDFormatter(),
+		log:                   log,
+		reporter:              reporter,
+		executorFactory:       executorFactory,
+		api:                   api,
+		botID:                 cfg.BotID,
+		commGroupMetadata:     commGroupMetadata,
+		channels:              channelsCfg,
+		botMentionRegex:       botMentionRegex,
+		renderer:              NewDiscordRenderer(),
+		messages:              make(chan discordMessage, platformMessageChannelSize),
+		discordMessageWorkers: pool.New().WithMaxGoroutines(platformMessageWorkersCount),
+		status:                health.StatusUnknown,
+		failureReason:         "",
 	}, nil
 }
 
-// Start starts the Discord websocket connection and listens for messages.
+func (b *Discord) startMessageProcessor(ctx context.Context) {
+	b.log.Info("Starting discord message processor...")
+	defer b.log.Info("Stopped discord message processor...")
+
+	for msg := range b.messages {
+		b.discordMessageWorkers.Go(func() {
+			err := b.handleMessage(ctx, msg)
+			if err != nil {
+				b.log.WithError(err).Error("Failed to handle Discord message")
+			}
+		})
+	}
+} // Start starts the Discord websocket connection and listens for messages.
 func (b *Discord) Start(ctx context.Context) error {
 	b.log.Info("Starting bot")
 
 	// Register the messageCreate func as a callback for MessageCreate events.
 	b.api.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
-		msg := discordMessage{
+		b.messages <- discordMessage{
 			Event: m,
-		}
-		if err := b.handleMessage(ctx, msg); err != nil {
-			b.log.Errorf("Message handling error: %s", err.Error())
 		}
 	})
 
 	// Open a websocket connection to Discord and begin listening.
 	err := b.api.Open()
 	if err != nil {
+		b.setFailureReason(health.FailureReasonConnectionError, fmt.Sprintf("while opening connection: %s", err.Error()))
 		return fmt.Errorf("while opening connection: %w", err)
 	}
 
-	err = b.reporter.ReportBotEnabled(b.IntegrationName())
+	err = b.reporter.ReportBotEnabled(b.IntegrationName(), b.commGroupMetadata.Index)
 	if err != nil {
-		return fmt.Errorf("while reporting analytics: %w", err)
+		b.log.Errorf("report analytics error: %s", err.Error())
 	}
 
 	b.log.Info("Botkube connected to Discord!")
-
+	b.setFailureReason("", "")
+	go b.startMessageProcessor(ctx)
 	<-ctx.Done()
 	b.log.Info("Shutdown requested. Finishing...")
-	err = b.api.Close()
-	if err != nil {
-		return fmt.Errorf("while closing connection: %w", err)
-	}
-
+	b.shutdown()
 	return nil
 }
 
-// SendEvent sends event notification to Discord ChannelID.
+// SendMessage sends interactive message to selected Discord channels.
 // Context is not supported by client: See https://github.com/bwmarrin/discordgo/issues/752.
-func (b *Discord) SendEvent(_ context.Context, event event.Event, eventSources []string) (err error) {
-	b.log.Debugf("Sending to Discord: %+v", event)
-
-	msgToSend := b.formatMessage(event)
-
-	errs := multierror.New()
-	for _, channelID := range b.getChannelsToNotify(eventSources) {
-		msg := msgToSend // copy as the struct is modified when using Discord API client
-		if _, err := b.api.ChannelMessageSendComplex(channelID, &msg); err != nil {
-			errs = multierror.Append(errs, fmt.Errorf("while sending Discord message to channel %q: %w", channelID, err))
-			continue
-		}
-
-		b.log.Debugf("Event successfully sent to channel %q", channelID)
-	}
-
-	return errs.ErrorOrNil()
-}
-
-// SendGenericMessage sends interactive message to selected Discord channels.
-// Context is not supported by client: See https://github.com/bwmarrin/discordgo/issues/752.
-func (b *Discord) SendGenericMessage(_ context.Context, genericMsg interactive.GenericMessage, sourceBindings []string) error {
-	msg := genericMsg.ForBot(b.BotName())
-
+func (b *Discord) SendMessage(_ context.Context, msg interactive.CoreMessage, sourceBindings []string) error {
 	errs := multierror.New()
 	for _, channelID := range b.getChannelsToNotify(sourceBindings) {
-		b.log.Debugf("Sending message to channel %q: %+v", channelID, msg)
-
 		err := b.send(channelID, msg)
 		if err != nil {
 			errs = multierror.Append(errs, fmt.Errorf("while sending Discord message to channel %q: %w", channelID, err))
 			continue
 		}
-		b.log.Debugf("Message successfully sent to channel %q", channelID)
 	}
 
 	return errs.ErrorOrNil()
@@ -175,18 +160,16 @@ func (b *Discord) SendGenericMessage(_ context.Context, genericMsg interactive.G
 
 // SendMessageToAll sends interactive message to all Discord channels.
 // Context is not supported by client: See https://github.com/bwmarrin/discordgo/issues/752.
-func (b *Discord) SendMessageToAll(_ context.Context, msg interactive.Message) error {
+func (b *Discord) SendMessageToAll(_ context.Context, msg interactive.CoreMessage) error {
 	errs := multierror.New()
 	for _, channel := range b.getChannels() {
 		channelID := channel.ID
-		plaintext := interactive.RenderMessage(b.mdFormatter, msg)
-		b.log.Debugf("Sending message to channel %q: %s", channelID, plaintext)
 
-		if _, err := b.api.ChannelMessageSend(channelID, plaintext); err != nil {
+		err := b.send(channelID, msg)
+		if err != nil {
 			errs = multierror.Append(errs, fmt.Errorf("while sending Discord message to channel %q: %w", channelID, err))
 			continue
 		}
-		b.log.Debugf("Message successfully sent to channel %q", channelID)
 	}
 
 	return errs.ErrorOrNil()
@@ -258,22 +241,33 @@ func (b *Discord) handleMessage(ctx context.Context, dm discordMessage) error {
 
 	b.log.Debugf("Discord incoming Request: %s", req)
 
-	channel, isAuthChannel := b.getChannels()[dm.Event.ChannelID]
+	channel, exists := b.getChannels()[dm.Event.ChannelID]
+	if !exists {
+		channel = channelConfigByID{
+			ChannelBindingsByID: config.ChannelBindingsByID{
+				ID: dm.Event.ChannelID,
+			},
+		}
+	}
 
 	e := b.executorFactory.NewDefault(execute.NewDefaultInput{
-		CommGroupName:   b.commGroupName,
+		CommGroupName:   b.commGroupMetadata.Name,
 		Platform:        b.IntegrationName(),
 		NotifierHandler: b,
 		Conversation: execute.Conversation{
 			Alias:            channel.alias,
+			DisplayName:      channel.name,
 			ID:               channel.Identifier(),
 			ExecutorBindings: channel.Bindings.Executors,
 			SourceBindings:   channel.Bindings.Sources,
-			IsAuthenticated:  isAuthChannel,
+			IsKnown:          exists,
 			CommandOrigin:    command.TypedOrigin,
 		},
 		Message: req,
-		User:    fmt.Sprintf("<@%s>", dm.Event.Author.ID),
+		User: execute.UserInput{
+			Mention:     fmt.Sprintf("<@%s>", dm.Event.Author.ID),
+			DisplayName: dm.Event.Author.String(),
+		},
 	})
 
 	response := e.Execute(ctx)
@@ -285,35 +279,20 @@ func (b *Discord) handleMessage(ctx context.Context, dm discordMessage) error {
 	return nil
 }
 
-func (b *Discord) send(channelID string, resp interactive.Message) error {
-	b.log.Debugf("Discord Response: %s", resp)
+func (b *Discord) send(channelID string, resp interactive.CoreMessage) error {
+	b.log.Debugf("Sending message to channel %q: %+v", channelID, resp)
 
-	markdown := interactive.RenderMessage(b.mdFormatter, resp)
+	resp.ReplaceBotNamePlaceholder(b.BotName())
 
-	if len(markdown) == 0 {
-		return errors.New("while reading Discord response: empty response")
+	discordMsg, err := b.formatMessage(resp)
+	if err != nil {
+		return fmt.Errorf("while formatting message: %w", err)
+	}
+	if _, err := b.api.ChannelMessageSendComplex(channelID, discordMsg); err != nil {
+		return fmt.Errorf("while sending message: %w", discordError(err, channelID))
 	}
 
-	// Upload message as a file if too long
-	if len(markdown) >= discordMaxMessageSize {
-		params := &discordgo.MessageSend{
-			Content: resp.Description,
-			Files: []*discordgo.File{
-				{
-					Name:   "Response.txt",
-					Reader: strings.NewReader(interactive.MessageToPlaintext(resp, interactive.NewlineFormatter)),
-				},
-			},
-		}
-		if _, err := b.api.ChannelMessageSendComplex(channelID, params); err != nil {
-			return fmt.Errorf("while uploading file: %w", err)
-		}
-		return nil
-	}
-
-	if _, err := b.api.ChannelMessageSend(channelID, markdown); err != nil {
-		return fmt.Errorf("while sending message: %w", err)
-	}
+	b.log.Debugf("Message successfully sent to channel %q", channelID)
 	return nil
 }
 
@@ -346,17 +325,81 @@ func (b *Discord) findAndTrimBotMention(msg string) (string, bool) {
 	return b.botMentionRegex.ReplaceAllString(msg, ""), true
 }
 
-func discordChannelsConfigFrom(channelsCfg config.IdentifiableMap[config.ChannelBindingsByID]) map[string]channelConfigByID {
+func (b *Discord) formatMessage(msg interactive.CoreMessage) (*discordgo.MessageSend, error) {
+	// 1. Check the size and upload message as a file if it's too long
+	plaintext := interactive.MessageToPlaintext(msg, interactive.NewlineFormatter)
+	if len(plaintext) == 0 {
+		return nil, errors.New("while reading Discord response: empty response")
+	}
+	if len(plaintext) >= discordMaxMessageSize {
+		return &discordgo.MessageSend{
+			Content: msg.Description,
+			Files: []*discordgo.File{
+				{
+					Name:   "Response.txt",
+					Reader: strings.NewReader(plaintext),
+				},
+			},
+		}, nil
+	}
+
+	// 2. If it's not a simplified event, render as markdown
+	if msg.Type != api.NonInteractiveSingleSection {
+		return &discordgo.MessageSend{
+			Content: b.renderer.MessageToMarkdown(msg),
+		}, nil
+	}
+
+	// TODO: For now, we just render only with a few fields that are always present in the event message.
+	// This should be removed once we will add support for rendering AdaptiveCard with all message primitives.
+	messageEmbed, err := b.renderer.NonInteractiveSectionToCard(msg)
+	if err != nil {
+		return nil, fmt.Errorf("while rendering event message embed: %w", err)
+	}
+
+	return &discordgo.MessageSend{
+		Embeds: []*discordgo.MessageEmbed{
+			&messageEmbed,
+		},
+	}, nil
+}
+
+func (b *Discord) shutdown() {
+	b.shutdownOnce.Do(func() {
+		b.log.Info("Shutting down discord message processor...")
+		err := b.api.Close()
+		if err != nil {
+			b.log.WithError(err).Error("Failed to close discord connection")
+		}
+
+		close(b.messages)
+		b.discordMessageWorkers.Wait()
+	})
+}
+
+func discordChannelsConfigFrom(log logrus.FieldLogger, api *discordgo.Session, channelsCfg config.IdentifiableMap[config.ChannelBindingsByID]) (map[string]channelConfigByID, error) {
 	res := make(map[string]channelConfigByID)
 	for channAlias, channCfg := range channelsCfg {
+		normalizedChannelID, changed := conversationx.NormalizeChannelIdentifier(channCfg.ID)
+		if changed {
+			log.Warnf("Channel ID %q has been normalized to %q", channCfg.ID, normalizedChannelID)
+		}
+		channCfg.ID = normalizedChannelID
+
+		channelData, err := api.Channel(channCfg.Identifier())
+		if err != nil {
+			return nil, fmt.Errorf("while getting channel name for ID %q: %w", channCfg.Identifier(), discordError(err, channCfg.Identifier()))
+		}
+
 		res[channCfg.Identifier()] = channelConfigByID{
 			ChannelBindingsByID: channCfg,
 			alias:               channAlias,
 			notify:              !channCfg.Notification.Disabled,
+			name:                channelData.Name,
 		}
 	}
 
-	return res
+	return res, nil
 }
 
 func discordBotMentionRegex(botID string) (*regexp.Regexp, error) {
@@ -366,4 +409,37 @@ func discordBotMentionRegex(botID string) (*regexp.Regexp, error) {
 	}
 
 	return botMentionRegex, nil
+}
+
+func discordError(err error, channel string) error {
+	switch err := err.(type) {
+	case *discordgo.RESTError:
+		switch err.Response.StatusCode {
+		case http.StatusUnauthorized:
+			return errors.New("invalid discord credentials")
+		case http.StatusNotFound:
+			return fmt.Errorf("channel %q not found", channel)
+		}
+	}
+	return err
+}
+
+func (b *Discord) setFailureReason(reason health.FailureReasonMsg, errorMsg string) {
+	if reason == "" {
+		b.status = health.StatusHealthy
+	} else {
+		b.status = health.StatusUnHealthy
+	}
+	b.failureReason = reason
+	b.errorMsg = errorMsg
+}
+
+// GetStatus gets bot status.
+func (b *Discord) GetStatus() health.PlatformStatus {
+	return health.PlatformStatus{
+		Status:   b.status,
+		Restarts: "0/0",
+		Reason:   b.failureReason,
+		ErrorMsg: b.errorMsg,
+	}
 }

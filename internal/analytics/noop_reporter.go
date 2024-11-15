@@ -6,7 +6,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/kubeshop/botkube/pkg/config"
-	"github.com/kubeshop/botkube/pkg/execute/command"
 )
 
 var _ Reporter = &NoopReporter{}
@@ -20,37 +19,47 @@ func NewNoopReporter() *NoopReporter {
 }
 
 // RegisterCurrentIdentity loads the current anonymous identity and registers it.
-func (n NoopReporter) RegisterCurrentIdentity(_ context.Context, _ kubernetes.Interface) error {
+func (n NoopReporter) RegisterCurrentIdentity(_ context.Context, _ kubernetes.Interface, _ string) error {
 	return nil
 }
 
 // ReportCommand reports a new executed command. The command should be anonymized before using this method.
-func (n NoopReporter) ReportCommand(_ config.CommPlatformIntegration, _ string, _ command.Origin, _ bool) error {
+func (n NoopReporter) ReportCommand(_ ReportCommandInput) error {
 	return nil
 }
 
 // ReportBotEnabled reports an enabled bot.
-func (n NoopReporter) ReportBotEnabled(_ config.CommPlatformIntegration) error {
+func (n NoopReporter) ReportBotEnabled(_ config.CommPlatformIntegration, _ int) error {
 	return nil
 }
 
 // ReportSinkEnabled reports an enabled sink.
-func (n NoopReporter) ReportSinkEnabled(_ config.CommPlatformIntegration) error {
+func (n NoopReporter) ReportSinkEnabled(_ config.CommPlatformIntegration, _ int) error {
 	return nil
 }
 
 // ReportHandledEventSuccess reports a successfully handled event using a given communication platform.
-func (n NoopReporter) ReportHandledEventSuccess(_ config.IntegrationType, _ config.CommPlatformIntegration, _ EventDetails) error {
+func (n NoopReporter) ReportHandledEventSuccess(_ ReportEventInput) error {
 	return nil
 }
 
 // ReportHandledEventError reports a failure while handling event using a given communication platform.
-func (n NoopReporter) ReportHandledEventError(_ config.IntegrationType, _ config.CommPlatformIntegration, _ EventDetails, _ error) error {
+func (n NoopReporter) ReportHandledEventError(_ ReportEventInput, _ error) error {
 	return nil
 }
 
 // ReportFatalError reports a fatal app error.
 func (n NoopReporter) ReportFatalError(_ error) error {
+	return nil
+}
+
+// ReportPluginsEnabled reports plugins enabled.
+func (n NoopReporter) ReportPluginsEnabled(_ map[string]config.Executors, _ map[string]config.Sources) error {
+	return nil
+}
+
+// Run runs the reporter.
+func (n NoopReporter) Run(_ context.Context) error {
 	return nil
 }
 

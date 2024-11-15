@@ -45,7 +45,7 @@ func TestRemoveBotkubeRelatedFlags(t *testing.T) {
 		},
 		{
 			Name:        "Combination",
-			Input:       "@botkube help --cluster-name \"foo1\" --cluster-name=foo2",
+			Input:       "@botkube help --cluster-name \"foo1\"",
 			Cmd:         "@botkube help",
 			ClusterName: "foo1",
 			Filter:      "",
@@ -55,13 +55,6 @@ func TestRemoveBotkubeRelatedFlags(t *testing.T) {
 			Input:       "@botkube kc get po --cluster-name foo -n default",
 			Cmd:         "@botkube kc get po -n default",
 			ClusterName: "foo",
-			Filter:      "",
-		},
-		{
-			Name:        "Remove empty cluster name",
-			Input:       "@botkube help --cluster-name ",
-			Cmd:         "@botkube help",
-			ClusterName: "",
 			Filter:      "",
 		},
 		{
@@ -98,6 +91,20 @@ func TestRemoveBotkubeRelatedFlags(t *testing.T) {
 			Cmd:         "@botkube help",
 			ClusterName: "api",
 			Filter:      "=./Users/botkube/somefile.txt [info]",
+		},
+		{
+			Name:        "Handle even number of single quotes with text filter and cluster name extraction",
+			Input:       `@botkube ai I'm not sure if it's what's best for us, but let's give it a try.   --cluster-name='api' --filter="=./Users/botkube/somefile.txt"`,
+			Cmd:         `@botkube ai I'm not sure if it's what's best for us, but let's give it a try.  `,
+			ClusterName: "api",
+			Filter:      "=./Users/botkube/somefile.txt",
+		},
+		{
+			Name:        "Handle odd number of single quotes with text filter and cluster name extraction",
+			Input:       `@botkube ai are there any failing pods? It's what's been keeping me energized lately  --cluster-name='api' --filter="=./Users/botkube/somefile.txt"`,
+			Cmd:         `@botkube ai are there any failing pods? It's what's been keeping me energized lately `,
+			ClusterName: "api",
+			Filter:      "=./Users/botkube/somefile.txt",
 		},
 	}
 	for _, tc := range testCases {

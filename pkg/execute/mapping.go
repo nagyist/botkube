@@ -6,71 +6,63 @@ import (
 	"fmt"
 	"text/tabwriter"
 
+	"github.com/kubeshop/botkube/pkg/api"
 	"github.com/kubeshop/botkube/pkg/bot/interactive"
 	"github.com/kubeshop/botkube/pkg/config"
+	"github.com/kubeshop/botkube/pkg/execute/command"
 	"github.com/kubeshop/botkube/pkg/multierror"
+	"github.com/kubeshop/botkube/pkg/plugin"
 )
 
 const (
-	helpMsgHeader = "%s %s [feature]\n\nAvailable features:\n"
+	helpMsgHeaderWithFeatures = "%s %s [feature]\n\nAvailable features:\n"
+	helpMsgHeader             = "%s %s"
 	// noFeature is used for commands that have no features defined
 	noFeature = ""
 	// incompleteCmdMsg incomplete command response message
 	incompleteCmdMsg = "You missed to pass options for the command. Please use 'help' to see command options."
 )
 
-// CommandVerb are commands supported by the bot
-type CommandVerb string
-
-// CommandVerb command options
-const (
-	CommandPing     CommandVerb = "ping"
-	CommandHelp     CommandVerb = "help"
-	CommandVersion  CommandVerb = "version"
-	CommandFeedback CommandVerb = "feedback"
-	CommandList     CommandVerb = "list"
-	CommandEnable   CommandVerb = "enable"
-	CommandDisable  CommandVerb = "disable"
-	CommandEdit     CommandVerb = "edit"
-	CommandStatus   CommandVerb = "status"
-	CommandShow     CommandVerb = "show"
-)
-
 // CommandExecutor defines command structure for executors
 type CommandExecutor interface {
-	Commands() map[CommandVerb]CommandFn
+	Commands() map[command.Verb]CommandFn
 	FeatureName() FeatureName
 }
 
+// executorFilter interface to implement to filter executor text based results
+type executorFilter interface {
+	Apply(string) string
+	IsActive() bool
+}
+
 // CommandFn is a single command (eg. List())
-type CommandFn func(ctx context.Context, cmdCtx CommandContext) (interactive.Message, error)
+type CommandFn func(ctx context.Context, cmdCtx CommandContext) (interactive.CoreMessage, error)
 
 // CommandContext contains the context for CommandFn
 type CommandContext struct {
+	// ExpandedRawCmd is a raw command with expanded aliases.
+	ExpandedRawCmd string
+
 	Args                []string
 	ClusterName         string
 	CommGroupName       string
-	BotName             string
-	RawCmd              string
 	CleanCmd            string
 	ProvidedClusterName string
-	User                string
+	User                UserInput
 	Conversation        Conversation
 	Platform            config.CommPlatformIntegration
 	ExecutorFilter      executorFilter
 	NotifierHandler     NotifierHandler
 	Mapping             *CommandMapping
+	CmdHeader           string
+	PluginHealthStats   *plugin.HealthStats
+	AuditContext        map[string]interface{}
 }
 
 // ProvidedClusterNameEqualOrEmpty returns true when provided cluster name is empty
 // or when provided cluster name is equal to cluster name
 func (cmdCtx CommandContext) ProvidedClusterNameEqualOrEmpty() bool {
-	return cmdCtx.ProvidedClusterName == "" || cmdCtx.ProvidedClusterNameEqual()
-}
-
-// ProvidedClusterNameEqual returns true when provided cluster name is equal to cluster name
-func (cmdCtx CommandContext) ProvidedClusterNameEqual() bool {
-	return cmdCtx.ProvidedClusterName == cmdCtx.ClusterName
+	return cmdCtx.ProvidedClusterName == "" || cmdCtx.ProvidedClusterName == cmdCtx.ClusterName
 }
 
 // FeatureName defines the name and aliases for a feature
@@ -81,15 +73,15 @@ type FeatureName struct {
 
 // CommandMapping allows to register and lookup commands and dynamically build help messages
 type CommandMapping struct {
-	commands map[CommandVerb]map[string]CommandFn
-	help     map[CommandVerb][]FeatureName
+	commands map[command.Verb]map[string]CommandFn
+	help     map[command.Verb][]FeatureName
 }
 
 // NewCmdsMapping registers command and help mappings
 func NewCmdsMapping(executors []CommandExecutor) (*CommandMapping, error) {
 	mappingsErrs := multierror.New()
-	cmdsMapping := make(map[CommandVerb]map[string]CommandFn)
-	helpMapping := make(map[CommandVerb][]FeatureName)
+	cmdsMapping := make(map[command.Verb]map[string]CommandFn)
+	helpMapping := make(map[command.Verb][]FeatureName)
 	for _, executor := range executors {
 		cmds := executor.Commands()
 		subCmd := executor.FeatureName()
@@ -120,7 +112,7 @@ func NewCmdsMapping(executors []CommandExecutor) (*CommandMapping, error) {
 }
 
 // FindFn looks up CommandFn by verb and feature
-func (m *CommandMapping) FindFn(verb CommandVerb, feature string) (CommandFn, bool, bool) {
+func (m *CommandMapping) FindFn(verb command.Verb, feature string) (CommandFn, bool, bool) {
 	features, ok := m.commands[verb]
 	if !ok {
 		return nil, false, false
@@ -132,16 +124,20 @@ func (m *CommandMapping) FindFn(verb CommandVerb, feature string) (CommandFn, bo
 	return fn, true, true
 }
 
-// HelpMessageForVerb dynamically builds help message for given CommandVerb, or empty string
-func (m *CommandMapping) HelpMessageForVerb(verb CommandVerb, botName string) string {
+// HelpMessageForVerb dynamically builds help message for given command.Verb, or empty string
+func (m *CommandMapping) HelpMessageForVerb(verb command.Verb) string {
 	cmd, ok := m.help[verb]
 	if !ok {
 		return incompleteCmdMsg
 	}
 	buf := new(bytes.Buffer)
 	w := tabwriter.NewWriter(buf, 3, 0, 1, ' ', 0)
+	if len(cmd) > 0 && cmd[0].Name != "" {
+		fmt.Fprintf(w, helpMsgHeaderWithFeatures, api.MessageBotNamePlaceholder, verb)
+	} else {
+		fmt.Fprintf(w, helpMsgHeader, api.MessageBotNamePlaceholder, verb)
+	}
 
-	fmt.Fprintf(w, helpMsgHeader, botName, verb)
 	for _, feature := range cmd {
 		aliases := removeEmptyFeatures(feature.Aliases)
 		fmtStr := fmt.Sprintf("%s\t", feature.Name)

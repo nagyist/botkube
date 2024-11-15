@@ -4,7 +4,7 @@
 //
 // To update golden files, run:
 //
-//	go test ./internal/analytics/... -test.update-golden
+//	go test ./internal/analytics -test.update-golden
 package analytics_test
 
 import (
@@ -12,7 +12,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	segment "github.com/segmentio/analytics-go"
 	"github.com/stretchr/testify/assert"
@@ -25,9 +27,9 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/kubeshop/botkube/internal/analytics"
-	"github.com/kubeshop/botkube/internal/loggerx"
 	"github.com/kubeshop/botkube/pkg/config"
 	"github.com/kubeshop/botkube/pkg/execute/command"
+	"github.com/kubeshop/botkube/pkg/loggerx"
 	"github.com/kubeshop/botkube/pkg/version"
 )
 
@@ -82,12 +84,15 @@ func TestSegmentReporter_RegisterCurrentIdentity(t *testing.T) {
 	segmentReporter, segmentCli := fakeSegmentReporterWithIdentity(nil)
 
 	// when
-	err := segmentReporter.RegisterCurrentIdentity(context.Background(), k8sCli)
+	err := segmentReporter.RegisterCurrentIdentity(context.Background(), k8sCli, "")
+	require.NoError(t, err)
+	err = segmentReporter.RegisterCurrentIdentity(context.Background(), k8sCli, "remote-deploy-id")
 	require.NoError(t, err)
 
 	// then
 	identity := segmentReporter.Identity()
-	assert.Equal(t, string(kubeSystemNs.UID), identity.ID)
+	assert.Equal(t, string(kubeSystemNs.UID), identity.AnonymousID)
+	assert.Equal(t, "remote-deploy-id", identity.DeploymentID)
 
 	compareMessagesAgainstGoldenFile(t, segmentCli.messages)
 }
@@ -98,13 +103,27 @@ func TestSegmentReporter_ReportCommand(t *testing.T) {
 	segmentReporter, segmentCli := fakeSegmentReporterWithIdentity(identity)
 
 	// when
-	err := segmentReporter.ReportCommand(config.DiscordCommPlatformIntegration, "enable notifications", command.TypedOrigin, false)
+	err := segmentReporter.ReportCommand(analytics.ReportCommandInput{
+		Platform: config.DiscordCommPlatformIntegration,
+		Command:  "enable notifications",
+		Origin:   command.TypedOrigin,
+	})
 	require.NoError(t, err)
 
-	err = segmentReporter.ReportCommand(config.SlackCommPlatformIntegration, "get", command.ButtonClickOrigin, false)
+	err = segmentReporter.ReportCommand(analytics.ReportCommandInput{
+		Platform:   config.CloudSlackCommPlatformIntegration,
+		PluginName: "botkube/kubectl",
+		Command:    "get",
+		Origin:     command.ButtonClickOrigin,
+		WithFilter: true,
+	})
 	require.NoError(t, err)
 
-	err = segmentReporter.ReportCommand(config.TeamsCommPlatformIntegration, "disable notifications", command.SelectValueChangeOrigin, false)
+	err = segmentReporter.ReportCommand(analytics.ReportCommandInput{
+		Platform: config.TeamsCommPlatformIntegration,
+		Command:  "disable notifications",
+		Origin:   command.SelectValueChangeOrigin,
+	})
 	require.NoError(t, err)
 
 	// then
@@ -117,19 +136,182 @@ func TestSegmentReporter_ReportBotEnabled(t *testing.T) {
 	segmentReporter, segmentCli := fakeSegmentReporterWithIdentity(identity)
 
 	// when
-	err := segmentReporter.ReportBotEnabled(config.SlackCommPlatformIntegration)
+	err := segmentReporter.ReportBotEnabled(config.CloudSlackCommPlatformIntegration, 1)
 	require.NoError(t, err)
 
 	// when
-	err = segmentReporter.ReportBotEnabled(config.DiscordCommPlatformIntegration)
+	err = segmentReporter.ReportBotEnabled(config.DiscordCommPlatformIntegration, 2)
 	require.NoError(t, err)
 
 	// when
-	err = segmentReporter.ReportBotEnabled(config.TeamsCommPlatformIntegration)
+	err = segmentReporter.ReportBotEnabled(config.TeamsCommPlatformIntegration, 1)
 	require.NoError(t, err)
 
 	// then
 	compareMessagesAgainstGoldenFile(t, segmentCli.messages)
+}
+
+func TestSegmentReporter_ReportPluginsEnabled(t *testing.T) {
+	// given
+	executors := map[string]config.Executors{
+		"botkube/helm_11yy1": {
+			DisplayName: "helm",
+			Plugins: map[string]config.Plugin{
+				"botkube/helm": {
+					Enabled: true,
+					Config:  "{}",
+					Context: config.PluginContext{
+						RBAC: &config.PolicyRule{
+							User: config.UserPolicySubject{
+								Type: config.StaticPolicySubjectType,
+								Static: config.UserStaticSubject{
+									Value: "user-name",
+								},
+								Prefix: "custom-user-prefix",
+							},
+							Group: config.GroupPolicySubject{
+								Type: config.StaticPolicySubjectType,
+								Static: config.GroupStaticSubject{
+									Values: []string{
+										config.RBACDefaultGroup,
+										"custom-group-name",
+									},
+								},
+								Prefix: "custom-group-prefix",
+							},
+						},
+					},
+				},
+			},
+		},
+		"botkube/kubectl_44yy4": {
+			DisplayName: "kubectl",
+			Plugins: map[string]config.Plugin{
+				"botkube/kubectl": {
+					Enabled: true,
+					Config:  "{}",
+					Context: config.PluginContext{
+						RBAC: &config.PolicyRule{
+							User: config.UserPolicySubject{
+								Type: config.StaticPolicySubjectType,
+								Static: config.UserStaticSubject{
+									Value: "user-name",
+								},
+								Prefix: "custom-user-prefix",
+							},
+							Group: config.GroupPolicySubject{
+								Type: config.ChannelNamePolicySubjectType,
+								Static: config.GroupStaticSubject{
+									Values: []string{},
+								},
+								Prefix: "custom-channel-prefix",
+							},
+						},
+					},
+				},
+			},
+		},
+		"botkube/kubectl_2": {
+			DisplayName: "kubectl",
+			Plugins: map[string]config.Plugin{
+				"botkube/kubectl": {
+					Enabled: true,
+					Config:  "{}",
+					Context: config.PluginContext{
+						RBAC: nil,
+					},
+				},
+			},
+		},
+	}
+	sources := map[string]config.Sources{
+		"botkube/kubernetes_22yy2": {
+			DisplayName: "k8s",
+			Plugins: map[string]config.Plugin{
+				"botkube/kubernetes": {
+					Enabled: true,
+					Config:  "{}",
+					Context: config.PluginContext{
+						RBAC: &config.PolicyRule{
+							User: config.UserPolicySubject{
+								Type: config.StaticPolicySubjectType,
+								Static: config.UserStaticSubject{
+									Value: config.RBACDefaultUser,
+								},
+							},
+							Group: config.GroupPolicySubject{
+								Type: config.StaticPolicySubjectType,
+								Static: config.GroupStaticSubject{
+									Values: []string{
+										config.RBACDefaultGroup,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		"botkube/keptn_33yy3": {
+			DisplayName: "keptn",
+			Plugins: map[string]config.Plugin{
+				"botkube/kubernetes": {
+					Enabled: false,
+					Config:  "{}",
+					Context: config.PluginContext{
+						RBAC: &config.PolicyRule{
+							User: config.UserPolicySubject{
+								Type: config.EmptyPolicySubjectType,
+								Static: config.UserStaticSubject{
+									Value: "",
+								},
+							},
+							Group: config.GroupPolicySubject{
+								Type: config.StaticPolicySubjectType,
+								Static: config.GroupStaticSubject{
+									Values: []string{
+										config.RBACDefaultGroup,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		"botkube/kubernetes_2": {
+			DisplayName: "kubernetes",
+			Plugins: map[string]config.Plugin{
+				"botkube/kubernetes": {
+					Enabled: true,
+					Config:  "{}",
+					Context: config.PluginContext{
+						RBAC: nil,
+					},
+				},
+			},
+		},
+	}
+
+	executors2, err := deepClone[map[string]config.Executors](executors)
+	require.NoError(t, err)
+
+	sources2, err := deepClone[map[string]config.Sources](sources)
+	require.NoError(t, err)
+
+	identity := fixIdentity()
+	segmentReporter, segmentCli := fakeSegmentReporterWithIdentity(identity)
+
+	// when
+	err = segmentReporter.ReportPluginsEnabled(executors, sources)
+	require.NoError(t, err)
+
+	// then
+	compareMessagesAgainstGoldenFile(t, segmentCli.messages)
+
+	// ensure the report doesn't modify the original maps
+	assert.Equal(t, executors2, executors)
+	assert.Equal(t, sources2, sources)
 }
 
 func TestSegmentReporter_ReportSinkEnabled(t *testing.T) {
@@ -138,55 +320,83 @@ func TestSegmentReporter_ReportSinkEnabled(t *testing.T) {
 	segmentReporter, segmentCli := fakeSegmentReporterWithIdentity(identity)
 
 	// when
-	err := segmentReporter.ReportSinkEnabled(config.WebhookCommPlatformIntegration)
+	err := segmentReporter.ReportSinkEnabled(config.WebhookCommPlatformIntegration, 1)
 	require.NoError(t, err)
 
 	// when
-	err = segmentReporter.ReportSinkEnabled(config.ElasticsearchCommPlatformIntegration)
+	err = segmentReporter.ReportSinkEnabled(config.ElasticsearchCommPlatformIntegration, 2)
 	require.NoError(t, err)
 
 	// then
 	compareMessagesAgainstGoldenFile(t, segmentCli.messages)
 }
 
-func TestSegmentReporter_ReportHandledEventSuccess(t *testing.T) {
+// ReportHandledEventSuccess and ReportHandledEventError are tested together as a part of TestSegmentReporter_Run.
+
+func TestSegmentReporter_Run(t *testing.T) {
 	// given
-	identity := fixIdentity()
-	segmentReporter, segmentCli := fakeSegmentReporterWithIdentity(identity)
-	eventDetails := analytics.EventDetails{
-		Type:       "create",
-		APIVersion: "apps/v1",
-		Kind:       "Deployment",
-	}
-
-	// when
-	err := segmentReporter.ReportHandledEventSuccess(config.BotIntegrationType, config.SlackCommPlatformIntegration, eventDetails)
-	require.NoError(t, err)
-
-	err = segmentReporter.ReportHandledEventSuccess(config.SinkIntegrationType, config.ElasticsearchCommPlatformIntegration, eventDetails)
-	require.NoError(t, err)
-
-	// then
-	compareMessagesAgainstGoldenFile(t, segmentCli.messages)
-}
-
-func TestSegmentReporter_ReportHandledEventError(t *testing.T) {
-	// given
-	identity := fixIdentity()
-	segmentReporter, segmentCli := fakeSegmentReporterWithIdentity(identity)
-	eventDetails := analytics.EventDetails{
-		Type:       "create",
-		APIVersion: "apps/v1",
-		Kind:       "Deployment",
-	}
+	tick := 50 * time.Millisecond
+	timeout := 5 * time.Second
 	sampleErr := errors.New("sample error")
 
+	identity := fixIdentity()
+	segmentReporter, segmentCli := fakeSegmentReporterWithIdentity(identity)
+	segmentReporter.SetTickDuration(tick)
+
+	eventDetails := map[string]interface{}{
+		"type":       "create",
+		"apiVersion": "apps/v1",
+		"kind":       "Deployment",
+	}
+
 	// when
-	err := segmentReporter.ReportHandledEventError(config.BotIntegrationType, config.SlackCommPlatformIntegration, eventDetails, sampleErr)
+	ctx, cancelFn := context.WithTimeout(context.Background(), timeout)
+	defer cancelFn()
+
+	wg := sync.WaitGroup{}
+	var runErr error
+	wg.Add(1)
+	go func(ctx context.Context) {
+		defer wg.Done()
+		runErr = segmentReporter.Run(ctx)
+	}(ctx)
+
+	err := segmentReporter.ReportHandledEventSuccess(analytics.ReportEventInput{
+		IntegrationType:       config.BotIntegrationType,
+		Platform:              config.CloudSlackCommPlatformIntegration,
+		PluginName:            "botkube/kubernetes",
+		AnonymizedEventFields: eventDetails,
+	})
 	require.NoError(t, err)
 
-	err = segmentReporter.ReportHandledEventError(config.SinkIntegrationType, config.ElasticsearchCommPlatformIntegration, eventDetails, sampleErr)
+	err = segmentReporter.ReportHandledEventError(analytics.ReportEventInput{
+		IntegrationType:       config.SinkIntegrationType,
+		Platform:              config.ElasticsearchCommPlatformIntegration,
+		PluginName:            "botkube/kubernetes",
+		AnonymizedEventFields: eventDetails,
+	}, sampleErr)
 	require.NoError(t, err)
+
+	time.Sleep(tick + 5*time.Millisecond)
+
+	err = segmentReporter.ReportHandledEventSuccess(analytics.ReportEventInput{
+		IntegrationType:       config.BotIntegrationType,
+		Platform:              config.TeamsCommPlatformIntegration,
+		PluginName:            "botkube/argocd",
+		AnonymizedEventFields: eventDetails,
+	})
+	require.NoError(t, err)
+	err = segmentReporter.ReportHandledEventSuccess(analytics.ReportEventInput{
+		IntegrationType:       config.BotIntegrationType,
+		Platform:              config.CloudSlackCommPlatformIntegration,
+		PluginName:            "botkube/kubernetes",
+		AnonymizedEventFields: eventDetails,
+	})
+	require.NoError(t, err)
+
+	cancelFn()
+	wg.Wait()
+	require.NoError(t, runErr)
 
 	// then
 	compareMessagesAgainstGoldenFile(t, segmentCli.messages)
@@ -240,7 +450,7 @@ func compareMessagesAgainstGoldenFile(t *testing.T, actualMessages []segment.Mes
 
 func fixIdentity() *analytics.Identity {
 	return &analytics.Identity{
-		ID: "cluster-id",
+		AnonymousID: "cluster-id",
 		KubernetesVersion: k8sVersion.Info{
 			Major:        "k8s-major",
 			Minor:        "k8s-minor",
@@ -260,4 +470,18 @@ func fixIdentity() *analytics.Identity {
 		WorkerNodeCount:       0,
 		ControlPlaneNodeCount: 0,
 	}
+}
+
+func deepClone[T any](in any) (any, error) {
+	origJSON, err := json.Marshal(in)
+	if err != nil {
+		return nil, err
+	}
+
+	var out T
+	if err = json.Unmarshal(origJSON, &out); err != nil {
+		return nil, err
+	}
+
+	return out, nil
 }

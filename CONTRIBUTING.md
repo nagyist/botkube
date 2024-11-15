@@ -22,10 +22,11 @@ This section describes how to build and run Botkube from source code.
 - Kubernetes cluster, at least 1.21
 - Cloned Botkube repository
 
-   Use the following command to clone it:
-   ```sh
-   git clone https://github.com/kubeshop/botkube.git
-   ```
+  Use the following command to clone it:
+
+  ```sh
+  git clone https://github.com/kubeshop/botkube.git
+  ```
 
 ### Build and install on Kubernetes
 
@@ -39,12 +40,13 @@ This section describes how to build and run Botkube from source code.
 
      For example, the command below builds the `linux/arm64` target:
 
-        ```sh
-        IMAGE_PLATFORM=linux/arm64 make container-image-single
-        docker tag ghcr.io/kubeshop/botkube:v9.99.9-dev {your_account}/botkube:v9.99.9-dev
-        docker push {your_account}/botkube:v9.99.9-dev
-        ```
-        Where `{your_account}` is Docker hub or any other registry provider account to which you can push the image.
+     ```sh
+     IMAGE_PLATFORM=linux/arm64 make container-image-single
+     docker tag ghcr.io/kubeshop/botkube:v9.99.9-dev {your_account}/botkube:v9.99.9-dev
+     docker push {your_account}/botkube:v9.99.9-dev
+     ```
+
+     Where `{your_account}` is Docker hub or any other registry provider account to which you can push the image.
 
    - **Multi-arch target builds for any K8s cluster**
 
@@ -89,22 +91,39 @@ For faster development, you can also build and run Botkube outside K8s cluster.
    # Fetch the dependencies
    go mod download
    # Build the binary
-   go build ./cmd/botkube/
+   go build -o botkube-agent ./cmd/botkube-agent/
    ```
 
-2. Use templates to create configuration files:
+2. Create a local configuration file to override default values. For example, set communication credentials, specify cluster name, and disable analytics:
 
-   ```sh
-   cp global_config.yaml.tpl resource_config.yaml
-   cp comm_config.yaml.tpl comm_config.yaml
+   ```yaml
+   cat <<EOF > local_config.yaml
+   communications:
+     default-group:
+       socketSlack:
+         enabled: true
+         channels:
+           default:
+             name: random
+         appToken: "xapp-xxxx"
+         botToken: "xoxb-xxxx"
+   configWatcher:
+      enabled: false
+   settings:
+     clusterName: "labs"
+   analytics:
+     # -- If true, sending anonymous analytics is disabled. To learn what date we collect,
+     # see [Privacy Policy](https://botkube.io/privacy#privacy-policy).
+     disable: true
+   EOF
    ```
 
-   Edit the newly created `resource_config.yaml` and `comm_config.yaml` files to configure resource and set communication credentials.
+   To learn more about configuration, visit https://docs.botkube.io/configuration/.
 
-3. Export the path to directory of `config.yaml`
+3. Export paths to configuration files. The priority will be given to the last (right-most) file specified.
 
    ```sh
-   export BOTKUBE_CONFIG_PATHS="$(pwd)/resource_config.yaml,$(pwd)/comm_config.yaml"
+   export BOTKUBE_CONFIG_PATHS="$(pwd)/helm/botkube/values.yaml,$(pwd)/local_config.yaml"
    ```
 
 4. Export the path to Kubeconfig:
@@ -118,16 +137,17 @@ For faster development, you can also build and run Botkube outside K8s cluster.
    ```sh
    kubectl cluster-info
    ```
+
    ```sh
    Kubernetes master is running at https://192.168.39.233:8443
    CoreDNS is running at https://192.168.39.233:8443/api/v1/namespaces/kube-system/services/kube-dns:dns/proxy
    ...
    ```
 
-6. Run Botkube binary:
+6. Run Botkube agent binary:
 
    ```sh
-   ./botkube
+   ./botkube-agent
    ```
 
 #### Develop Botkube plugins
@@ -142,11 +162,11 @@ For faster development, you can also build and run Botkube outside K8s cluster.
 1. Start fake plugins server to serve binaries from [`dist`](dist) folder:
 
    ```bash
-   go run test/helpers/plugin_server.go
+   go run hack/target/serve-plugins/main.go
    ```
 
-	 > **Note**
-	 > If Botkube runs inside the k3d cluster, export the `PLUGIN_SERVER_HOST=http://host.k3d.internal` environment variable.
+   > **Note**
+   > If Botkube runs inside the k3d cluster, export the `PLUGIN_SERVER_HOST=http://host.k3d.internal` environment variable.
 
 2. Export Botkube plugins cache directory:
 
@@ -162,11 +182,14 @@ For faster development, you can also build and run Botkube outside K8s cluster.
    # remove cached plugins
    rm -rf $BOTKUBE_PLUGINS_CACHE__DIR &&
    # start botkube to download fresh plugins
-   ./botkube
+   ./botkube-agent
    ```
 
    > **Note**
    > Each time you make a change to the [source](cmd/source) or [executors](cmd/executor) plugins re-run the above command.
+
+   > **Note**
+   > To build specific plugin binaries, use `PLUGIN_TARGETS`. For example `PLUGIN_TARGETS="kubernetes,echo" make build-plugins-single`.
 
 ## Making A Change
 
@@ -182,6 +205,7 @@ For faster development, you can also build and run Botkube outside K8s cluster.
   # From project root directory
   make lint-fix
   ```
+
   This will run the `golangci-lint` tool to lint the Go code.
 
 ### Run the e2e tests
@@ -191,6 +215,7 @@ Here [are the details you need](./test/README.md) to set up and run the e2e test
 ### Create a Pull Request
 
 - Make sure your pull request has [good commit messages](https://chris.beams.io/posts/git-commit/):
+
   - Separate subject from body with a blank line
   - Limit the subject line to 50 characters
   - Capitalize the subject line

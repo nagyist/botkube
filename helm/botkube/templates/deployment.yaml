@@ -35,6 +35,7 @@ spec:
 {{ toYaml .Values.extraAnnotations | indent 8 }}
       {{- end }}
     spec:
+      automountServiceAccountToken: false
       {{- if .Values.priorityClassName }}
       priorityClassName: "{{ .Values.priorityClassName }}"
       {{- end }}
@@ -54,30 +55,35 @@ spec:
           {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           {{ end }}
           readinessProbe:
-            successThreshold: 1
-            failureThreshold: 3
-            periodSeconds: 5
-            initialDelaySeconds: 1
-            timeoutSeconds: 1
+            successThreshold: {{ .Values.deployment.readinessProbe.successThreshold }}
+            failureThreshold: {{ .Values.deployment.readinessProbe.failureThreshold }}
+            periodSeconds: {{ .Values.deployment.readinessProbe.periodSeconds }}
+            initialDelaySeconds: {{ .Values.deployment.readinessProbe.initialDelaySeconds }}
+            timeoutSeconds: {{ .Values.deployment.readinessProbe.timeoutSeconds }}
             httpGet:
               path: /healthz
               port: {{ .Values.settings.healthPort }}
           livenessProbe:
-            successThreshold: 1
-            failureThreshold: 3
-            periodSeconds: 10
-            initialDelaySeconds: 1
-            timeoutSeconds: 1
+            successThreshold: {{ .Values.deployment.livenessProbe.successThreshold }}
+            failureThreshold: {{ .Values.deployment.livenessProbe.failureThreshold }}
+            periodSeconds: {{ .Values.deployment.livenessProbe.periodSeconds }}
+            initialDelaySeconds: {{ .Values.deployment.livenessProbe.initialDelaySeconds }}
+            timeoutSeconds: {{ .Values.deployment.livenessProbe.timeoutSeconds }}
             httpGet:
               path: /healthz
               port: {{ .Values.settings.healthPort }}
           volumeMounts:
             - name: cache-volume
               mountPath: /tmp
+            - name: default-sa
+              mountPath: {{.Values.rbac.serviceAccountMountPath}}
+              readOnly: true
+          {{- if not (include "botkube.remoteConfigEnabled" $) }}
             - name: config-volume
               mountPath: "/config"
             - name: startup-config
               mountPath: "/startup-config"
+          {{- end }}
           {{- with .Values.extraVolumeMounts }}
             {{ toYaml . | nindent 12 }}
           {{- end }}
@@ -92,11 +98,11 @@ spec:
           {{ end }}
             - name: cache
               mountPath: "/.kube/cache"
-            - name: cfg-watcher-tmp
-              mountPath: {{ .Values.configWatcher.tmpDir }}
           env:
+            {{- if not (include "botkube.remoteConfigEnabled" $) }}
             - name: BOTKUBE_CONFIG_PATHS
               value: "/config/global_config.yaml,/config/comm_config.yaml,/config/{{ .Values.settings.persistentConfig.runtime.fileName}},/startup-config/{{ .Values.settings.persistentConfig.startup.fileName}}"
+            {{- end }}
             - name: BOTKUBE_SETTINGS_METRICS__PORT
               value: {{ .Values.service.targetPort | quote }}
             {{- if .Values.kubeconfig.enabled }}
@@ -109,18 +115,26 @@ spec:
               value: "{{.Release.Namespace}}"
             - name: BOTKUBE_SETTINGS_PERSISTENT__CONFIG_STARTUP_CONFIG__MAP_NAMESPACE
               value: "{{.Release.Namespace}}"
-            - name: BOTKUBE_SETTINGS_LIFECYCLE__SERVER_DEPLOYMENT_NAMESPACE
+            - name: BOTKUBE_CONFIG__WATCHER_DEPLOYMENT_NAMESPACE
               value: "{{.Release.Namespace}}"
-            - name: BOTKUBE_SETTINGS_LIFECYCLE__SERVER_DEPLOYMENT_NAME
+            - name: BOTKUBE_CONFIG__WATCHER_DEPLOYMENT_NAME
               value: "{{ include "botkube.fullname" . }}"
-            {{- if .Values.config.provider.endpoint }}
             - name: CONFIG_PROVIDER_ENDPOINT
               value: {{ .Values.config.provider.endpoint }}
-            {{- end }}
             {{- if .Values.config.provider.identifier }}
             - name: CONFIG_PROVIDER_IDENTIFIER
               value: "{{ .Values.config.provider.identifier }}"
             {{- end }}
+            {{- if .Values.config.provider.apiKey }}
+            - name: CONFIG_PROVIDER_API_KEY
+              value: "{{ .Values.config.provider.apiKey }}"
+            {{- end }}
+            - name: BOTKUBE_SETTINGS_SA__CREDENTIALS__PATH__PREFIX
+              value: {{.Values.rbac.serviceAccountMountPath}}/default-sa
+            - name: BOTKUBE_PLUGINS_INCOMING__WEBHOOK_PORT
+              value: {{ .Values.plugins.incomingWebhook.port | quote }}
+            - name: BOTKUBE_PLUGINS_INCOMING__WEBHOOK_IN__CLUSTER__BASE__U__R__L
+              value: "http://{{ include "botkube.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.plugins.incomingWebhook.port }}"
           {{- with .Values.extraEnv }}
             {{ toYaml . | nindent 12 }}
           {{- end }}
@@ -128,40 +142,21 @@ spec:
           resources:
 {{ toYaml .Values.resources | indent 12 }}
           {{- end }}
-        {{- if .Values.configWatcher.enabled }}
-        - name: cfg-watcher
-          image: "{{ .Values.configWatcher.image.registry }}/{{ .Values.configWatcher.image.repository }}:{{ .Values.configWatcher.image.tag }}"
-          imagePullPolicy: "{{ .Values.configWatcher.image.pullPolicy }}"
-          env:
-            - name: FOLDER
-              value: {{ .Values.configWatcher.tmpDir }}
-            - name: RESOURCE
-              value: "both"
-            - name: LOG_LEVEL
-              value: "DEBUG"
-            - name: NAMESPACE
-              value: "{{.Release.Namespace}}"
-            - name: LABEL
-              value: "botkube.io/config-watch"
-            - name: LABEL_VALUE
-              value: "true"
-            - name: REQ_URL
-              value: "http://{{ include "botkube.fullname" . }}:{{.Values.settings.lifecycleServer.port}}/reload"
-            - name: REQ_IGNORE_INITIAL_EVENT
-              value: "true"
-            - name: REQ_METHOD
-              value: "POST"
-            - name: IGNORE_ALREADY_PROCESSED
-              value: "true"
-          volumeMounts:
-            - name: cfg-watcher-tmp
-              mountPath: {{ .Values.configWatcher.tmpDir }}
-        {{- end }}
       volumes:
-        - name: cfg-watcher-tmp
-          emptyDir: {}
         - name: cache-volume
           emptyDir: {}
+        - name: default-sa
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: default-sa-token
+                  expirationSeconds: 3600
+              - configMap:
+                  items:
+                  - key: ca.crt
+                    path: default-sa-ca.crt
+                  name: kube-root-ca.crt
+        {{- if not (include "botkube.remoteConfigEnabled" $) }}
         - name: config-volume
           projected:
             sources:
@@ -176,6 +171,7 @@ spec:
         - name: startup-config
           configMap:
             name: {{ .Values.settings.persistentConfig.startup.configMap.name }}
+        {{ end }}
       {{- with .Values.extraVolumes }}
         {{ toYaml . | nindent 8 }}
       {{- end }}

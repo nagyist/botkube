@@ -1,87 +1,44 @@
 package bot
 
 import (
-	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/slack-go/slack"
 
+	"github.com/kubeshop/botkube/pkg/api"
 	"github.com/kubeshop/botkube/pkg/bot/interactive"
-	"github.com/kubeshop/botkube/pkg/config"
-	"github.com/kubeshop/botkube/pkg/event"
-	formatx "github.com/kubeshop/botkube/pkg/format"
+	"github.com/kubeshop/botkube/pkg/formatx"
 )
 
 const (
 	urlButtonActionIDPrefix = "url:"
 	cmdButtonActionIDPrefix = "cmd:"
+	maxActionIDLen          = 254
 )
-
-var emojiForLevel = map[config.Level]string{
-	config.Info:     ":large_green_circle:",
-	config.Warn:     ":warning:",
-	config.Debug:    ":information_source:",
-	config.Error:    ":x:",
-	config.Critical: ":x:",
-}
 
 // SlackRenderer provides functionality to render Slack specific messages from a generic models.
 type SlackRenderer struct {
-	notification config.Notification
+	mdFormatter interactive.MDFormatter
 }
 
 // NewSlackRenderer returns new SlackRenderer instance.
-func NewSlackRenderer(notificationType config.Notification) *SlackRenderer {
-	return &SlackRenderer{notification: notificationType}
+func NewSlackRenderer() *SlackRenderer {
+	return &SlackRenderer{
+		mdFormatter: interactive.NewMDFormatter(interactive.NewlineFormatter, func(msg string) string {
+			return fmt.Sprintf("*%s*", msg)
+		}),
+	}
 }
 
-// RenderLegacyEventMessage returns Slack message based on a given event.
-func (b *SlackRenderer) RenderLegacyEventMessage(event event.Event) slack.Attachment {
-	var attachment slack.Attachment
-
-	switch b.notification.Type {
-	case config.LongNotification:
-		attachment = b.legacyLongNotification(event)
-	case config.ShortNotification:
-		fallthrough
-	default:
-		attachment = b.legacyShortNotification(event)
-	}
-
-	// Add timestamp
-	ts := json.Number(strconv.FormatInt(event.TimeStamp.Unix(), 10))
-	if ts > "0" {
-		attachment.Ts = ts
-	}
-	attachment.Color = attachmentColor[event.Level]
-	return attachment
-}
-
-// RenderEventMessage returns Slack interactive message based on a given event.
-func (b *SlackRenderer) RenderEventMessage(event event.Event, additionalSections ...interactive.Section) interactive.Message {
-	var sections []interactive.Section
-
-	switch b.notification.Type {
-	case config.LongNotification:
-		sections = append(sections, b.longNotificationSection(event))
-	case config.ShortNotification:
-		fallthrough
-	default:
-		sections = append(sections, b.shortNotificationSection(event))
-	}
-
-	if len(additionalSections) > 0 {
-		sections = append(sections, additionalSections...)
-	}
-
-	return interactive.Message{Sections: sections}
+// MessageToMarkdown renders message in Markdown format.
+func (b *SlackRenderer) MessageToMarkdown(in interactive.CoreMessage) string {
+	return interactive.RenderMessage(b.mdFormatter, in)
 }
 
 // RenderModal returns a modal request view based on a given message.
-func (b *SlackRenderer) RenderModal(msg interactive.Message) slack.ModalViewRequest {
+func (b *SlackRenderer) RenderModal(msg interactive.CoreMessage) slack.ModalViewRequest {
 	title := msg.Header
 	msg.Header = ""
 	return slack.ModalViewRequest{
@@ -97,7 +54,7 @@ func (b *SlackRenderer) RenderModal(msg interactive.Message) slack.ModalViewRequ
 }
 
 // RenderInteractiveMessage returns Slack message based on the input msg.
-func (b *SlackRenderer) RenderInteractiveMessage(msg interactive.Message) slack.MsgOption {
+func (b *SlackRenderer) RenderInteractiveMessage(msg interactive.CoreMessage) slack.MsgOption {
 	if msg.HasSections() || msg.HasInputs() {
 		blocks := b.RenderAsSlackBlocks(msg)
 		return slack.MsgOptionBlocks(blocks...)
@@ -106,7 +63,7 @@ func (b *SlackRenderer) RenderInteractiveMessage(msg interactive.Message) slack.
 }
 
 // RenderAsSlackBlocks returns the Slack message blocks for a given input message.
-func (b *SlackRenderer) RenderAsSlackBlocks(msg interactive.Message) []slack.Block {
+func (b *SlackRenderer) RenderAsSlackBlocks(msg interactive.CoreMessage) []slack.Block {
 	var blocks []slack.Block
 	if msg.Header != "" {
 		blocks = append(blocks, b.mdTextSection("*%s*", msg.Header))
@@ -116,29 +73,37 @@ func (b *SlackRenderer) RenderAsSlackBlocks(msg interactive.Message) []slack.Blo
 		blocks = append(blocks, b.mdTextSection(msg.Description))
 	}
 
-	if msg.Body.Plaintext != "" {
-		blocks = append(blocks, b.mdTextSection(msg.Body.Plaintext))
+	if msg.BaseBody.Plaintext != "" {
+		blocks = append(blocks, b.mdTextSection(msg.BaseBody.Plaintext))
 	}
 
-	if msg.Body.CodeBlock != "" {
-		blocks = append(blocks, b.mdTextSection(formatx.AdaptiveCodeBlock(msg.Body.CodeBlock)))
+	if msg.BaseBody.CodeBlock != "" {
+		blocks = append(blocks, b.mdTextSection(formatx.AdaptiveCodeBlock(msg.BaseBody.CodeBlock)))
 	}
 
-	all := len(msg.Sections)
 	for idx, s := range msg.Sections {
-		blocks = append(blocks, b.renderSection(s)...)
-		if !(idx == all-1) { // if not the last one, append divider
+		if idx > 0 && s.Style.Divider != api.DividerStyleTopNone {
 			blocks = append(blocks, slack.NewDividerBlock())
 		}
+		blocks = append(blocks, b.renderSection(s)...)
 	}
+
 	for _, i := range msg.PlaintextInputs {
 		blocks = append(blocks, b.renderInput(i))
+	}
+
+	if !msg.Timestamp.IsZero() {
+		fallbackTimestampText := msg.Timestamp.Format(time.RFC1123)
+		timestampText := fmt.Sprintf("<!date^%d^{date_num} {time_secs}|%s>", msg.Timestamp.Unix(), fallbackTimestampText)
+		blocks = append(blocks, b.renderContext([]api.ContextItem{{
+			Text: timestampText,
+		}})...)
 	}
 
 	return blocks
 }
 
-func (b *SlackRenderer) renderSelects(s interactive.Selects) slack.Block {
+func (b *SlackRenderer) renderSelects(s api.Selects) *slack.ActionBlock {
 	var elems []slack.BlockElement
 	for _, s := range s.Items {
 		placeholder := slack.NewTextBlockObject(slack.PlainTextType, s.Name, false, false)
@@ -174,7 +139,7 @@ func (b *SlackRenderer) renderSelects(s interactive.Selects) slack.Block {
 	)
 }
 
-func (b *SlackRenderer) renderAsSimpleTextSection(msg interactive.Message) slack.MsgOption {
+func (b *SlackRenderer) renderAsSimpleTextSection(msg interactive.CoreMessage) slack.MsgOption {
 	var out strings.Builder
 	if msg.Header != "" {
 		out.WriteString(msg.Header + "\n")
@@ -183,20 +148,20 @@ func (b *SlackRenderer) renderAsSimpleTextSection(msg interactive.Message) slack
 		out.WriteString(msg.Description + "\n")
 	}
 
-	if msg.Body.Plaintext != "" {
-		out.WriteString(msg.Body.Plaintext)
+	if msg.BaseBody.Plaintext != "" {
+		out.WriteString(msg.BaseBody.Plaintext)
 	}
 
-	if msg.Body.CodeBlock != "" {
+	if msg.BaseBody.CodeBlock != "" {
 		// we don't use the AdaptiveCodeBlock as we want to have a code block even for single lines
 		// to make it more readable in the wide view.
-		out.WriteString(formatx.CodeBlock(msg.Body.CodeBlock))
+		out.WriteString(formatx.CodeBlock(msg.BaseBody.CodeBlock))
 	}
 
 	return slack.MsgOptionText(out.String(), false)
 }
 
-func (b *SlackRenderer) renderSection(in interactive.Section) []slack.Block {
+func (b *SlackRenderer) renderSection(in api.Section) []slack.Block {
 	var out []slack.Block
 	if in.Header != "" {
 		out = append(out, b.mdTextSection("*%s*", in.Header))
@@ -222,14 +187,23 @@ func (b *SlackRenderer) renderSection(in interactive.Section) []slack.Block {
 		out = append(out, b.renderInput(item))
 	}
 
-	out = append(out, b.renderButtons(in.Buttons)...)
+	if in.BulletLists.AreItemsDefined() {
+		out = append(out, b.renderBulletLists(in.BulletLists))
+	}
+
+	var selects *slack.ActionBlock
+	if in.Selects.AreOptionsDefined() {
+		selects = b.renderSelects(in.Selects)
+	}
+	btns, used := b.renderButtons(in.Buttons, selects)
+	out = append(out, btns...)
+	if !used && selects != nil {
+		out = append(out, selects)
+	}
+
 	if in.MultiSelect.AreOptionsDefined() {
 		sec := b.renderMultiselectWithDescription(in.MultiSelect)
 		out = append(out, sec)
-	}
-
-	if in.Selects.AreOptionsDefined() {
-		out = append(out, b.renderSelects(in.Selects))
 	}
 
 	if len(in.Context) > 0 {
@@ -239,15 +213,16 @@ func (b *SlackRenderer) renderSection(in interactive.Section) []slack.Block {
 	return out
 }
 
-func (b *SlackRenderer) renderTextFields(in interactive.TextFields) slack.Block {
+func (b *SlackRenderer) renderTextFields(in api.TextFields) slack.Block {
 	var textBlockObjs []*slack.TextBlockObject
 	for _, item := range in {
-		if item.Text == "" {
+		if item.IsEmpty() {
 			// Skip empty sections
 			continue
 		}
 
-		textBlockObjs = append(textBlockObjs, slack.NewTextBlockObject(slack.MarkdownType, item.Text, false, false))
+		field := fmt.Sprintf("*%s:* %s", item.Key, item.Value)
+		textBlockObjs = append(textBlockObjs, slack.NewTextBlockObject(slack.MarkdownType, field, false, false))
 	}
 
 	return slack.NewSectionBlock(
@@ -257,7 +232,7 @@ func (b *SlackRenderer) renderTextFields(in interactive.TextFields) slack.Block 
 	)
 }
 
-func (b *SlackRenderer) renderContext(in []interactive.ContextItem) []slack.Block {
+func (b *SlackRenderer) renderContext(in []api.ContextItem) []slack.Block {
 	var blocks []slack.Block
 
 	for _, item := range in {
@@ -283,37 +258,68 @@ func (b *SlackRenderer) renderContext(in []interactive.ContextItem) []slack.Bloc
 //
 //  2. Without description: all in the same row. For example:
 //     [Button "Get Pods"] [Button "Get Deployments"]
-func (b *SlackRenderer) renderButtons(in interactive.Buttons) []slack.Block {
+func (b *SlackRenderer) renderButtons(in api.Buttons, selects *slack.ActionBlock) ([]slack.Block, bool) {
 	if len(in) == 0 {
-		return nil
+		return nil, false
 	}
 
-	if in.AtLeastOneButtonHasDescription() {
-		// We use section layout as we also want to add text description
-		// https://api.slack.com/reference/block-kit/blocks#section
-		return b.renderButtonsWithDescription(in)
+	var out []slack.Block
+	// We use section layout as we also want to add text description
+	// https://api.slack.com/reference/block-kit/blocks#section
+	out = append(out, b.renderButtonsWithDescription(in.GetButtonsWithDescription())...)
+
+	btnsWithoutDesc := in.GetButtonsWithoutDescription()
+	if len(btnsWithoutDesc) == 0 {
+		return out, false
 	}
 
 	var btns []slack.BlockElement
-	for _, btn := range in {
+	for _, btn := range btnsWithoutDesc {
 		btns = append(btns, b.renderButton(btn))
 	}
 
-	return []slack.Block{
+	var elements []slack.BlockElement
+	blockID := ""
+	if selects != nil {
+		blockID = selects.BlockID
+
+		if selects.Elements != nil {
+			elements = selects.Elements.ElementSet
+		}
+	}
+	elements = append(elements, btns...)
+
+	out = append(out,
 		// We use actions layout as we have only buttons that we want to display in a single line.
 		// https://api.slack.com/reference/block-kit/blocks#actions
 		slack.NewActionBlock(
-			"",
-			btns...,
-		),
-	}
+			blockID,
+			elements...,
+		))
+
+	return out, true
 }
 
-func (b *SlackRenderer) renderButtonsWithDescription(in interactive.Buttons) []slack.Block {
+func (b *SlackRenderer) renderButtonsWithDescription(in api.Buttons) []slack.Block {
 	var out []slack.Block
 	for _, btn := range in {
+		desc := btn.Description
+		switch btn.DescriptionStyle {
+		case api.ButtonDescriptionStyleBold:
+			desc = fmt.Sprintf("*%s*", desc)
+		case api.ButtonDescriptionStyleItalic:
+			desc = fmt.Sprintf("_%s_", desc)
+		case api.ButtonDescriptionStyleText:
+			// no op, it should be just a simple string
+		case api.ButtonDescriptionStyleCode:
+			fallthrough
+		default:
+			// keep backward compatibility
+			desc = formatx.AdaptiveCodeBlock(desc)
+		}
+
 		out = append(out, slack.NewSectionBlock(
-			slack.NewTextBlockObject(slack.MarkdownType, formatx.AdaptiveCodeBlock(btn.Description), false, false),
+			slack.NewTextBlockObject(slack.MarkdownType, desc, false, false),
 			nil,
 			slack.NewAccessory(b.renderButton(btn)),
 		))
@@ -321,7 +327,7 @@ func (b *SlackRenderer) renderButtonsWithDescription(in interactive.Buttons) []s
 	return out
 }
 
-func (b *SlackRenderer) renderInput(s interactive.LabelInput) slack.Block {
+func (b *SlackRenderer) renderInput(s api.LabelInput) slack.Block {
 	var placeholder *slack.TextBlockObject
 	if s.Placeholder != "" {
 		placeholder = slack.NewTextBlockObject(slack.PlainTextType, s.Placeholder, false, false)
@@ -346,7 +352,7 @@ func (b *SlackRenderer) renderInput(s interactive.LabelInput) slack.Block {
 	return block
 }
 
-func (b *SlackRenderer) renderMultiselectWithDescription(in interactive.MultiSelect) slack.Block {
+func (b *SlackRenderer) renderMultiselectWithDescription(in api.MultiSelect) slack.Block {
 	placeholder := slack.NewTextBlockObject(slack.PlainTextType, in.Name, false, false)
 	multiSelect := slack.NewOptionsMultiSelectBlockElement("multi_static_select", placeholder, in.Command)
 
@@ -370,7 +376,7 @@ func (b *SlackRenderer) renderMultiselectWithDescription(in interactive.MultiSel
 	)
 }
 
-func (b *SlackRenderer) renderButton(btn interactive.Button) slack.BlockElement {
+func (b *SlackRenderer) renderButton(btn api.Button) slack.BlockElement {
 	return &slack.ButtonBlockElement{
 		Type:     slack.METButton,
 		Text:     slack.NewTextBlockObject(slack.PlainTextType, btn.Name, true, false),
@@ -383,11 +389,24 @@ func (b *SlackRenderer) renderButton(btn interactive.Button) slack.BlockElement 
 	}
 }
 
-func (b *SlackRenderer) genBtnActionID(btn interactive.Button) string {
+// id must be less than 256 characters, see:
+// https://api.slack.com/reference/block-kit/block-elements#button
+func (b *SlackRenderer) genBtnActionID(btn api.Button) string {
 	if btn.Command != "" {
-		return cmdButtonActionIDPrefix + btn.Command
+		stop := b.intWithMax(maxActionIDLen-len(cmdButtonActionIDPrefix), len(btn.Command))
+		return cmdButtonActionIDPrefix + btn.Command[:stop]
 	}
-	return urlButtonActionIDPrefix + btn.URL
+
+	// must be less than 256 characters
+	stop := b.intWithMax(maxActionIDLen-len(urlButtonActionIDPrefix), len(btn.URL))
+	return urlButtonActionIDPrefix + btn.URL[:stop]
+}
+
+func (*SlackRenderer) intWithMax(a, max int) int {
+	if a > max {
+		return max
+	}
+	return a
 }
 
 func (*SlackRenderer) mdTextSection(in string, args ...any) *slack.SectionBlock {
@@ -402,141 +421,36 @@ func (*SlackRenderer) plainTextBlock(msg string) *slack.TextBlockObject {
 	return slack.NewTextBlockObject(slack.PlainTextType, msg, false, false)
 }
 
-func (b *SlackRenderer) longNotificationSection(event event.Event) interactive.Section {
-	section := b.baseNotificationSection(event)
-	section.TextFields = interactive.TextFields{
-		{Text: fmt.Sprintf("*Kind:* %s", event.Kind)},
-		{Text: fmt.Sprintf("*Name:* %s", event.Name)},
+func (b *SlackRenderer) renderBulletLists(in api.BulletLists) slack.Block {
+	strBuilder := strings.Builder{}
+	for _, item := range in {
+		if len(item.Items) == 0 {
+			continue
+		}
+		strBuilder.WriteString(fmt.Sprintf("*%s*\n%s", item.Title, formatx.BulletPointListFromMessages(item.Items)))
+		strBuilder.WriteString("\n")
 	}
-	section.TextFields = b.appendTextFieldIfNotEmpty(section.TextFields, "Namespace", event.Namespace)
-	section.TextFields = b.appendTextFieldIfNotEmpty(section.TextFields, "Reason", event.Reason)
-	section.TextFields = b.appendTextFieldIfNotEmpty(section.TextFields, "Action", event.Action)
-	section.TextFields = b.appendTextFieldIfNotEmpty(section.TextFields, "Cluster", event.Cluster)
 
-	// Messages, Recommendations and Warnings formatted as bullet point lists.
-	section.Body.Plaintext = formatx.BulletPointEventAttachments(event)
-
-	return section
+	return b.mdTextSection(strBuilder.String())
 }
 
-func (b *SlackRenderer) appendTextFieldIfNotEmpty(fields []interactive.TextField, title, in string) []interactive.TextField {
-	if in == "" {
-		return fields
-	}
-	return append(fields, interactive.TextField{
-		Text: fmt.Sprintf("*%s:* %s", title, in),
-	})
-}
-
-func (b *SlackRenderer) shortNotificationSection(event event.Event) interactive.Section {
-	section := b.baseNotificationSection(event)
-
-	header := formatx.ShortNotificationHeader(event)
-	attachments := formatx.BulletPointEventAttachments(event)
-	prefix := ""
-	if attachments != "" {
-		prefix = "\n"
-	}
-
-	section.Base.Description = fmt.Sprintf(
-		"%s\n%s%s",
-		header,
-		prefix,
-		attachments,
-	)
-
-	return section
-}
-
-func (b *SlackRenderer) baseNotificationSection(event event.Event) interactive.Section {
-	emoji := emojiForLevel[event.Level]
-	section := interactive.Section{
-		Base: interactive.Base{
-			Header: fmt.Sprintf("%s %s", emoji, event.Title),
-		},
-	}
-
-	if !event.TimeStamp.IsZero() {
-		fallbackTimestampText := event.TimeStamp.Format(time.RFC1123)
-		timestampText := fmt.Sprintf("<!date^%d^{date_num} {time_secs}|%s>", event.TimeStamp.Unix(), fallbackTimestampText)
-		section.Context = []interactive.ContextItem{{
-			Text: timestampText,
-		}}
-	}
-
-	return section
-}
-
-func (b *SlackRenderer) legacyLongNotification(event event.Event) slack.Attachment {
-	attachment := slack.Attachment{
-		Pretext: fmt.Sprintf("*%s*", event.Title),
-		Fields: []slack.AttachmentField{
-			{
-				Title: "Kind",
-				Value: event.Kind,
-				Short: true,
-			},
-			{
-
-				Title: "Name",
-				Value: event.Name,
-				Short: true,
-			},
-		},
-		Footer: "Botkube",
-	}
-
-	attachment.Fields = b.appendIfNotEmpty(attachment.Fields, event.Namespace, "Namespace", true)
-	attachment.Fields = b.appendIfNotEmpty(attachment.Fields, event.Reason, "Reason", true)
-	attachment.Fields = b.appendIfNotEmpty(attachment.Fields, formatx.JoinMessages(event.Messages), "Message", false)
-	attachment.Fields = b.appendIfNotEmpty(attachment.Fields, event.Action, "Action", true)
-	attachment.Fields = b.appendIfNotEmpty(attachment.Fields, formatx.JoinMessages(event.Recommendations), "Recommendations", false)
-	attachment.Fields = b.appendIfNotEmpty(attachment.Fields, formatx.JoinMessages(event.Warnings), "Warnings", false)
-	attachment.Fields = b.appendIfNotEmpty(attachment.Fields, event.Cluster, "Cluster", false)
-
-	return attachment
-}
-
-func (b *SlackRenderer) appendIfNotEmpty(fields []slack.AttachmentField, in string, title string, short bool) []slack.AttachmentField {
-	if in == "" {
-		return fields
-	}
-	return append(fields, slack.AttachmentField{
-		Title: title,
-		Value: in,
-		Short: short,
-	})
-}
-
-func (b *SlackRenderer) legacyShortNotification(event event.Event) slack.Attachment {
-	return slack.Attachment{
-		Title: event.Title,
-		Fields: []slack.AttachmentField{
-			{
-				Value: formatx.ShortMessage(event),
-			},
-		},
-		Footer: "Botkube",
-	}
-}
-
-func convertToSlackStyle(in interactive.ButtonStyle) slack.Style {
+func convertToSlackStyle(in api.ButtonStyle) slack.Style {
 	switch in {
-	case interactive.ButtonStyleDefault:
+	case api.ButtonStyleDefault:
 		return slack.StyleDefault
-	case interactive.ButtonStylePrimary:
+	case api.ButtonStylePrimary:
 		return slack.StylePrimary
-	case interactive.ButtonStyleDanger:
+	case api.ButtonStyleDanger:
 		return slack.StyleDanger
 	}
 	return slack.StyleDefault
 }
 
-func convertToSlackSelectType(in interactive.SelectType) string {
+func convertToSlackSelectType(in api.SelectType) string {
 	switch in {
-	case interactive.StaticSelect:
+	case api.StaticSelect:
 		return slack.OptTypeStatic
-	case interactive.ExternalSelect:
+	case api.ExternalSelect:
 		return slack.OptTypeExternal
 	}
 	return slack.OptTypeStatic

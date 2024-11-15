@@ -1,10 +1,8 @@
 package config
 
 import (
-	"context"
 	_ "embed"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -13,18 +11,13 @@ import (
 	koanfyaml "github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/providers/rawbytes"
-	"github.com/spf13/pflag"
+	"github.com/mitchellh/mapstructure"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
-
-	"github.com/kubeshop/botkube/internal/config"
-	"github.com/kubeshop/botkube/internal/loggerx"
 )
 
 //go:embed default.yaml
 var defaultConfiguration []byte
-
-var configPathsFlag []string
 
 const (
 	configEnvVariablePrefix = "BOTKUBE_"
@@ -34,8 +27,15 @@ const (
 )
 
 const (
-	// AllNamespaceIndicator represents a keyword for allowing all Kubernetes Namespaces.
-	AllNamespaceIndicator = ".*"
+	// allValuesPattern represents a keyword for allowing all values.
+	allValuesPattern = ".*"
+)
+
+const (
+	// RBACDefaultGroup describes default rbac group name.
+	RBACDefaultGroup = "botkube-plugins-default"
+	// RBACDefaultUser describes default rbac user name.
+	RBACDefaultUser = "botkube-internal-static-user"
 )
 
 // EventType to watch
@@ -80,11 +80,11 @@ const (
 type CommPlatformIntegration string
 
 const (
-	// SlackCommPlatformIntegration defines Slack integration.
-	SlackCommPlatformIntegration CommPlatformIntegration = "slack"
-
 	// SocketSlackCommPlatformIntegration defines Slack integration.
 	SocketSlackCommPlatformIntegration CommPlatformIntegration = "socketSlack"
+
+	// CloudSlackCommPlatformIntegration defines Slack integration.
+	CloudSlackCommPlatformIntegration CommPlatformIntegration = "cloudSlack"
 
 	// MattermostCommPlatformIntegration defines Mattermost integration.
 	MattermostCommPlatformIntegration CommPlatformIntegration = "mattermost"
@@ -92,19 +92,43 @@ const (
 	// TeamsCommPlatformIntegration defines Teams integration.
 	TeamsCommPlatformIntegration CommPlatformIntegration = "teams"
 
+	// CloudTeamsCommPlatformIntegration defines Teams integration.
+	CloudTeamsCommPlatformIntegration CommPlatformIntegration = "cloudTeams"
+
 	// DiscordCommPlatformIntegration defines Discord integration.
 	DiscordCommPlatformIntegration CommPlatformIntegration = "discord"
 
-	//ElasticsearchCommPlatformIntegration defines Elasticsearch integration.
+	// ElasticsearchCommPlatformIntegration defines Elasticsearch integration.
 	ElasticsearchCommPlatformIntegration CommPlatformIntegration = "elasticsearch"
 
 	// WebhookCommPlatformIntegration defines an outgoing webhook integration.
 	WebhookCommPlatformIntegration CommPlatformIntegration = "webhook"
+
+	// PagerDutyCommPlatformIntegration defines an outgoing PagerDuty integration.
+	PagerDutyCommPlatformIntegration CommPlatformIntegration = "pagerDuty"
 )
+
+func (c CommPlatformIntegration) IsInteractive() bool {
+	return c == SocketSlackCommPlatformIntegration || c == CloudSlackCommPlatformIntegration || c == CloudTeamsCommPlatformIntegration
+}
 
 // String returns string platform name.
 func (c CommPlatformIntegration) String() string {
 	return string(c)
+}
+
+func (c CommPlatformIntegration) DisplayName() string {
+	switch c {
+	case SocketSlackCommPlatformIntegration, CloudSlackCommPlatformIntegration:
+		return "Slack"
+	case TeamsCommPlatformIntegration, CloudTeamsCommPlatformIntegration:
+		return "Teams"
+	case MattermostCommPlatformIntegration:
+		return "Mattermost"
+	case DiscordCommPlatformIntegration:
+		return "Discord"
+	}
+	return ""
 }
 
 // IntegrationType describes the type of integration with a communication platform.
@@ -118,51 +142,118 @@ const (
 	SinkIntegrationType IntegrationType = "sink"
 )
 
-// NotificationType to change notification type
-type NotificationType string
-
-const (
-	// ShortNotification is the default NotificationType
-	ShortNotification NotificationType = "short"
-	// LongNotification for short events notification
-	LongNotification NotificationType = "long"
-)
-
 // Config structure of configuration yaml file
 type Config struct {
 	Actions        Actions                   `yaml:"actions" validate:"dive"`
 	Sources        map[string]Sources        `yaml:"sources" validate:"dive"`
 	Executors      map[string]Executors      `yaml:"executors" validate:"dive"`
+	Aliases        Aliases                   `yaml:"aliases" validate:"dive"`
 	Communications map[string]Communications `yaml:"communications"  validate:"required,min=1,dive"`
-	Filters        Filters                   `yaml:"filters"`
 
-	Analytics     Analytics  `yaml:"analytics"`
-	Settings      Settings   `yaml:"settings"`
-	ConfigWatcher CfgWatcher `yaml:"configWatcher"`
-	Plugins       Plugins    `yaml:"plugins"`
+	Analytics     Analytics        `yaml:"analytics"`
+	Settings      Settings         `yaml:"settings"`
+	ConfigWatcher CfgWatcher       `yaml:"configWatcher"`
+	Plugins       PluginManagement `yaml:"plugins"`
 }
 
-// Plugins holds Botkube plugins related configuration.
-type Plugins struct {
-	CacheDir     string                         `yaml:"cacheDir"`
-	Repositories map[string]PluginsRepositories `yaml:"repositories"`
+// PluginManagement holds Botkube plugin management related configuration.
+type PluginManagement struct {
+	CacheDir            string                       `yaml:"cacheDir"`
+	Repositories        map[string]PluginsRepository `yaml:"repositories"`
+	IncomingWebhook     IncomingWebhook              `yaml:"incomingWebhook"`
+	RestartPolicy       PluginRestartPolicy          `yaml:"restartPolicy"`
+	HealthCheckInterval time.Duration                `yaml:"healthCheckInterval"`
 }
 
-// PluginsRepositories holds the Plugin repository information.
-type PluginsRepositories struct {
-	URL string `yaml:"url"`
+type PluginRestartPolicy struct {
+	Type      PluginRestartPolicyType `yaml:"type"`
+	Threshold int                     `yaml:"threshold"`
+}
+
+type PluginRestartPolicyType string
+
+const (
+	KeepAgentRunningWhenThresholdReached PluginRestartPolicyType = "DeactivatePlugin"
+	RestartAgentWhenThresholdReached     PluginRestartPolicyType = "RestartAgent"
+)
+
+func (p PluginRestartPolicyType) ToLower() string {
+	return strings.ToLower(string(p))
+}
+
+// PluginsRepository holds the Plugin repository information.
+type PluginsRepository struct {
+	URL     string `yaml:"url"`
+	Headers map[string]string
+}
+
+// IncomingWebhook contains configuration for incoming source webhook.
+type IncomingWebhook struct {
+	Enabled bool `yaml:"enabled"`
+	Port    int  `yaml:"port"`
+
+	// InClusterBaseURL is the in-cluster URL of the incoming webhook. Passed for plugins in context.
+	InClusterBaseURL string `yaml:"inClusterBaseURL"`
+}
+
+// CloudSlackChannel contains configuration bindings per channel.
+type CloudSlackChannel struct {
+	ChannelBindingsByName `yaml:",inline" mapstructure:",squash"`
+
+	// ChannelID is the Slack ID of the channel.
+	// Currently, it is used for AI plugin as it has ability to fetch the Botkube Agent configuration.
+	// Later it can be used for deep linking to a given channel, see: https://api.slack.com/reference/deep-linking#app_channel
+	ChannelID string `yaml:"channelID"`
+	// Alias is an optional public alias for a private channel.
+	Alias *string `yaml:"alias,omitempty"`
 }
 
 // ChannelBindingsByName contains configuration bindings per channel.
 type ChannelBindingsByName struct {
-	Name         string              `yaml:"name"`
-	Notification ChannelNotification `yaml:"notification"` // TODO: rename to `notifications` later
-	Bindings     BotBindings         `yaml:"bindings"`
+	Name            string                `yaml:"name"`
+	Notification    ChannelNotification   `yaml:"notification"` // TODO: rename to `notifications` later
+	Bindings        BotBindings           `yaml:"bindings"`
+	MessageTriggers []TextMessageTriggers `yaml:"messageTriggers"`
 }
 
-// Identifier returns ChannelBindingsByID identifier.
+// Identifier returns ChannelBindingsByName identifier.
 func (c ChannelBindingsByName) Identifier() string {
 	return c.Name
+}
+
+// GetBotBindings returns associated bindings.
+func (c ChannelBindingsByName) GetBotBindings() BotBindings {
+	return c.Bindings
+}
+
+type TextMessageTriggerEvent string
+
+const (
+	MessageTriggerChannelEvent TextMessageTriggerEvent = "ChannelMessage"
+)
+
+// TextMessageTriggers contains information about matching messages and their associated commands.
+type TextMessageTriggers struct {
+	Event                   TextMessageTriggerEvent `yaml:"event"`
+	Text                    RegexConstraints        `yaml:"text"`
+	Users                   UsersMessageConstraints `yaml:"users"`
+	Command                 string                  `yaml:"command"`
+	Executors               []string                `yaml:"executors"`
+	ProcessedEmojiIndicator *string                 `yaml:"processedEmojiIndicator,omitempty"`
+}
+
+type UsersMessageConstraints struct {
+	Exclude []string `yaml:"exclude"`
+}
+
+func (m *TextMessageTriggers) IsUserExcluded(userID string) bool {
+	for _, user := range m.Users.Exclude {
+		toIgnore, _, _ := strings.Cut(user, ":")
+		if toIgnore == userID {
+			return true
+		}
+	}
+	return false
 }
 
 // ChannelBindingsByID contains configuration bindings per channel.
@@ -175,6 +266,11 @@ type ChannelBindingsByID struct {
 // Identifier returns ChannelBindingsByID identifier.
 func (c ChannelBindingsByID) Identifier() string {
 	return c.ID
+}
+
+// GetBotBindings returns associated bindings.
+func (c ChannelBindingsByID) GetBotBindings() BotBindings {
+	return c.Bindings
 }
 
 // BotBindings contains configuration for possible Bot bindings.
@@ -207,130 +303,110 @@ type ActionBindings struct {
 
 // Sources contains configuration for Botkube app sources.
 type Sources struct {
-	DisplayName string           `yaml:"displayName"`
-	Kubernetes  KubernetesSource `yaml:"kubernetes"`
-	Plugins     PluginsExecutors `koanf:",remain"`
+	DisplayName string  `yaml:"displayName"`
+	Plugins     Plugins `yaml:",inline" koanf:",remain"`
 }
 
-// KubernetesSource contains configuration for Kubernetes sources.
-type KubernetesSource struct {
-	Recommendations Recommendations   `yaml:"recommendations"`
-	Event           KubernetesEvent   `yaml:"event"`
-	Resources       []Resource        `yaml:"resources" validate:"dive"`
-	Namespaces      Namespaces        `yaml:"namespaces"`
-	Annotations     map[string]string `yaml:"annotations"`
-	Labels          map[string]string `yaml:"labels"`
+// GetPlugins returns Sources.Plugins.
+func (s Sources) GetPlugins() Plugins {
+	return s.Plugins
 }
 
-// KubernetesEvent contains configuration for Kubernetes events.
-type KubernetesEvent struct {
-	Reason  string                       `yaml:"reason"`
-	Message string                       `yaml:"message"`
-	Types   KubernetesResourceEventTypes `yaml:"types"`
-}
+// Plugins contains plugins configuration parameters defined in groups.
+type Plugins map[string]Plugin
 
-// AreConstraintsDefined checks if any of the event constraints are defined.
-func (e KubernetesEvent) AreConstraintsDefined() bool {
-	return e.Reason != "" || e.Message != ""
-}
-
-// IsAllowed checks if a given resource event is allowed according to the configuration.
-func (r *KubernetesSource) IsAllowed(resourceType, namespace string, eventType EventType) bool {
-	if r == nil || len(r.Resources) == 0 {
-		return false
-	}
-
-	isEventAllowed := func(resourceEvents KubernetesResourceEventTypes) bool {
-		if len(resourceEvents) > 0 { // if resource overrides the global events, use them
-			return resourceEvents.Contains(eventType)
-		}
-		return r.Event.Types.Contains(eventType) // check global events
-	}
-
-	for _, resource := range r.Resources {
-		var namespaceAllowed bool
-		if resource.Namespaces.IsConfigured() {
-			namespaceAllowed = resource.Namespaces.IsAllowed(namespace)
-		} else {
-			namespaceAllowed = r.Namespaces.IsAllowed(namespace)
-		}
-
-		if resource.Type == resourceType &&
-			isEventAllowed(resource.Event.Types) &&
-			namespaceAllowed {
-			return true
-		}
-	}
-
-	return false
-}
-
-// Recommendations contains configuration for various recommendation insights.
-type Recommendations struct {
-	Ingress IngressRecommendations `yaml:"ingress"`
-	Pod     PodRecommendations     `yaml:"pod"`
-}
-
-// PodRecommendations contains configuration for pods recommendations.
-type PodRecommendations struct {
-	// NoLatestImageTag notifies about Pod containers that use `latest` tag for images.
-	NoLatestImageTag *bool `yaml:"noLatestImageTag,omitempty"`
-
-	// LabelsSet notifies about Pod resources created without labels.
-	LabelsSet *bool `yaml:"labelsSet,omitempty"`
-}
-
-// IngressRecommendations contains configuration for ingress recommendations.
-type IngressRecommendations struct {
-	// BackendServiceValid notifies about Ingress resources with invalid backend service reference.
-	BackendServiceValid *bool `yaml:"backendServiceValid,omitempty"`
-
-	// TLSSecretValid notifies about Ingress resources with invalid TLS secret reference.
-	TLSSecretValid *bool `yaml:"tlsSecretValid,omitempty"`
-}
-
-// PluginsExecutors contains plugins executors configuration parameters defined in groups.
-type PluginsExecutors map[string]PluginExecutor
-
-// PluginExecutor contains plugin specific configuration.
-type PluginExecutor struct {
+// Plugin contains plugin specific configuration.
+type Plugin struct {
 	Enabled bool
 	Config  any
+	Context PluginContext
 }
+
+// PluginContext defines the context for given plugin.
+type PluginContext struct {
+	// RBAC defines the RBAC rules for given plugin.
+	RBAC *PolicyRule `yaml:"rbac,omitempty"`
+}
+
+// PolicyRule is the RBAC rule.
+type PolicyRule struct {
+	// User is the policy subject for user.
+	User UserPolicySubject `yaml:"user"`
+	// Group is the policy subject for group.
+	Group GroupPolicySubject `yaml:"group"`
+}
+
+// GroupPolicySubject is the RBAC subject.
+type GroupPolicySubject struct {
+	// Type is the type of policy subject.
+	Type PolicySubjectType `yaml:"type"`
+	// Static is static reference of subject for given static policy rule.
+	Static GroupStaticSubject `yaml:"static"`
+	// Prefix is optional string prefixed to subjects.
+	Prefix string `yaml:"prefix"`
+}
+
+// GroupStaticSubject references static subjects for given static policy rule.
+type GroupStaticSubject struct {
+	// Values is the name of the subject.
+	Values []string `yaml:"values"`
+}
+
+// UserPolicySubject is the RBAC subject.
+type UserPolicySubject struct {
+	// Type is the type of policy subject.
+	Type PolicySubjectType `yaml:"type"`
+	// Static is static reference of subject for given static policy rule.
+	Static UserStaticSubject `yaml:"static"`
+	// Prefix is optional string prefixed to subjects.
+	Prefix string `yaml:"prefix"`
+}
+
+// UserStaticSubject references static subjects for given static policy rule.
+type UserStaticSubject struct {
+	// Value is the name of the subject.
+	Value string `yaml:"value"`
+}
+
+// PolicySubjectType defines the types for policy subjects.
+type PolicySubjectType string
+
+const (
+	// EmptyPolicySubjectType is the empty policy type.
+	EmptyPolicySubjectType PolicySubjectType = ""
+	// StaticPolicySubjectType is the static policy type.
+	StaticPolicySubjectType PolicySubjectType = "Static"
+	// ChannelNamePolicySubjectType is the channel name policy type.
+	ChannelNamePolicySubjectType PolicySubjectType = "ChannelName"
+)
 
 // Executors contains executors configuration parameters.
 type Executors struct {
-	Kubectl Kubectl          `yaml:"kubectl"`
-	Plugins PluginsExecutors `koanf:",remain"`
+	DisplayName string  `yaml:"displayName"`
+	Plugins     Plugins `yaml:",inline" koanf:",remain"`
 }
 
-// Filters contains configuration for built-in filters.
-type Filters struct {
-	Kubernetes KubernetesFilters `yaml:"kubernetes"`
-}
-
-// KubernetesFilters contains configuration for Kubernetes-related filters.
-type KubernetesFilters struct {
-	// ObjectAnnotationChecker enables support for `botkube.io/disable` and `botkube.io/channel` resource annotations.
-	ObjectAnnotationChecker bool `yaml:"objectAnnotationChecker"`
-
-	// NodeEventsChecker filters out Node-related events that are not important.
-	NodeEventsChecker bool `yaml:"nodeEventsChecker"`
-}
-
-// SetEnabled enables or disables a given filter.
-func (f *KubernetesFilters) SetEnabled(name string, enabled bool) error {
-	if name == "ObjectAnnotationChecker" {
-		f.ObjectAnnotationChecker = enabled
-		return nil
+// CollectCommandPrefixes returns list of command prefixes for all executors, even disabled ones.
+func (e Executors) CollectCommandPrefixes() []string {
+	var prefixes []string
+	for pluginName := range e.Plugins {
+		prefixes = append(prefixes, ExecutorNameForKey(pluginName))
 	}
+	return prefixes
+}
 
-	if name == "NodeEventsChecker" {
-		f.NodeEventsChecker = enabled
-		return nil
-	}
+// GetPlugins returns Executors.Plugins
+func (e Executors) GetPlugins() Plugins {
+	return e.Plugins
+}
 
-	return fmt.Errorf("Filter with name %q not found", name)
+// Aliases contains aliases configuration.
+type Aliases map[string]Alias
+
+// Alias defines alias configuration for a given command.
+type Alias struct {
+	Command     string `yaml:"command" validate:"required"`
+	DisplayName string `yaml:"displayName"`
 }
 
 // Analytics contains configuration parameters for analytics collection.
@@ -338,116 +414,74 @@ type Analytics struct {
 	Disable bool `yaml:"disable"`
 }
 
-// Resource contains resources to watch
-type Resource struct {
-	Type          string            `yaml:"type"`
-	Name          string            `yaml:"name"`
-	Namespaces    Namespaces        `yaml:"namespaces"`
-	Annotations   map[string]string `yaml:"annotations"`
-	Labels        map[string]string `yaml:"labels"`
-	Event         KubernetesEvent   `yaml:"event"`
-	UpdateSetting UpdateSetting     `yaml:"updateSetting"`
-}
-
-// KubernetesResourceEventTypes contains events to watch for a resource.
-type KubernetesResourceEventTypes []EventType
-
-// Contains checks if event is contained in the events slice.
-// If the slice contains AllEvent, then the result is true.
-func (e *KubernetesResourceEventTypes) Contains(eventType EventType) bool {
-	if e == nil {
-		return false
-	}
-
-	for _, event := range *e {
-		if event == AllEvent {
-			return true
-		}
-
-		if event == eventType {
-			return true
-		}
-	}
-
-	return false
-}
-
-// UpdateSetting struct defines updateEvent fields specification
-type UpdateSetting struct {
-	Fields      []string `yaml:"fields"`
-	IncludeDiff bool     `yaml:"includeDiff"`
-}
-
-// Namespaces provides an option to include and exclude given Namespaces.
-type Namespaces struct {
-	// Include contains a list of allowed Namespaces.
+// RegexConstraints contains a list of allowed and excluded values.
+type RegexConstraints struct {
+	// Include contains a list of allowed values.
 	// It can also contain a regex expressions:
-	//  - ".*" - to specify all Namespaces.
+	//  - ".*" - to specify all values.
 	Include []string `yaml:"include"`
 
-	// Exclude contains a list of Namespaces to be ignored even if allowed by Include.
+	// Exclude contains a list of values to be ignored even if allowed by Include.
 	// It can also contain a regex expressions:
-	//  - "test-.*" - to specif all Namespaces with `test-` prefix.
+	//  - "test-.*" - to specify all values with `test-` prefix.
 	Exclude []string `yaml:"exclude,omitempty"`
 }
 
-// IsConfigured checks whether the Namespace has any Include/Exclude configuration.
-func (n *Namespaces) IsConfigured() bool {
-	return len(n.Include) > 0 || len(n.Exclude) > 0
+// AreConstraintsDefined checks whether the RegexConstraints has any Include/Exclude configuration.
+func (r *RegexConstraints) AreConstraintsDefined() bool {
+	return len(r.Include) > 0 || len(r.Exclude) > 0
 }
 
-// IsAllowed checks if a given Namespace is allowed based on the config.
-func (n *Namespaces) IsAllowed(givenNs string) bool {
-	if n == nil || givenNs == "" {
-		return false
+// IsAllowed checks if a given value is allowed based on the config.
+// Firstly, it checks if the value is excluded. If not, then it checks if the value is included.
+func (r *RegexConstraints) IsAllowed(value string) (bool, error) {
+	if r == nil {
+		return false, nil
 	}
 
 	// 1. Check if excluded
-	if len(n.Exclude) > 0 {
-		for _, excludeNamespace := range n.Exclude {
-			if strings.TrimSpace(excludeNamespace) == "" {
+	if len(r.Exclude) > 0 {
+		for _, excludeValue := range r.Exclude {
+			if strings.TrimSpace(excludeValue) == "" {
 				continue
 			}
 			// exact match
-			if excludeNamespace == givenNs {
-				return false
+			if excludeValue == value {
+				return false, nil
 			}
 
 			// regexp
-			matched, err := regexp.MatchString(excludeNamespace, givenNs)
-			if err == nil && matched {
-				return false
+			matched, err := regexp.MatchString(excludeValue, value)
+			if err != nil {
+				return false, fmt.Errorf("while matching %q with exclude regex %q: %v", value, excludeValue, err)
+			}
+			if matched {
+				return false, nil
 			}
 		}
 	}
 
 	// 2. Check if included, if matched, return true
-	if len(n.Include) > 0 {
-		for _, includeNamespace := range n.Include {
-			if strings.TrimSpace(includeNamespace) == "" {
-				continue
-			}
-
+	if len(r.Include) > 0 {
+		for _, includeValue := range r.Include {
 			// exact match
-			if includeNamespace == givenNs {
-				return true
+			if includeValue == value {
+				return true, nil
 			}
 
 			// regexp
-			matched, err := regexp.MatchString(includeNamespace, givenNs)
-			if err == nil && matched {
-				return true
+			matched, err := regexp.MatchString(includeValue, value)
+			if err != nil {
+				return false, fmt.Errorf("while matching %q with include regex %q: %v", value, includeValue, err)
+			}
+			if matched {
+				return true, nil
 			}
 		}
 	}
 
 	// 2.1. If not included, return false
-	return false
-}
-
-// Notification holds notification configuration.
-type Notification struct {
-	Type NotificationType
+	return false, nil
 }
 
 // ChannelNotification contains notification configuration for a given platform.
@@ -457,30 +491,46 @@ type ChannelNotification struct {
 
 // Communications contains communication platforms that are supported.
 type Communications struct {
-	Slack         Slack         `yaml:"slack"`
-	SocketSlack   SocketSlack   `yaml:"socketSlack"`
-	Mattermost    Mattermost    `yaml:"mattermost"`
-	Discord       Discord       `yaml:"discord"`
-	Teams         Teams         `yaml:"teams"`
-	Webhook       Webhook       `yaml:"webhook"`
-	Elasticsearch Elasticsearch `yaml:"elasticsearch"`
-}
-
-// Slack configuration to authentication and send notifications
-type Slack struct {
-	Enabled      bool                                   `yaml:"enabled"`
-	Channels     IdentifiableMap[ChannelBindingsByName] `yaml:"channels"  validate:"required_if=Enabled true,dive,omitempty,min=1"`
-	Notification Notification                           `yaml:"notification,omitempty"`
-	Token        string                                 `yaml:"token,omitempty"`
+	SocketSlack   SocketSlack   `yaml:"socketSlack,omitempty"`
+	CloudSlack    CloudSlack    `yaml:"cloudSlack,omitempty"`
+	Mattermost    Mattermost    `yaml:"mattermost,omitempty"`
+	Discord       Discord       `yaml:"discord,omitempty"`
+	CloudTeams    CloudTeams    `yaml:"cloudTeams,omitempty"`
+	Webhook       Webhook       `yaml:"webhook,omitempty"`
+	Elasticsearch Elasticsearch `yaml:"elasticsearch,omitempty"`
+	PagerDuty     PagerDuty     `yaml:"pagerDuty,omitempty"`
 }
 
 // SocketSlack configuration to authentication and send notifications
 type SocketSlack struct {
-	Enabled      bool                                   `yaml:"enabled"`
-	Channels     IdentifiableMap[ChannelBindingsByName] `yaml:"channels"  validate:"required_if=Enabled true,dive,omitempty,min=1"`
-	Notification Notification                           `yaml:"notification,omitempty"`
-	BotToken     string                                 `yaml:"botToken,omitempty"`
-	AppToken     string                                 `yaml:"appToken,omitempty"`
+	Enabled  bool                                   `yaml:"enabled"`
+	Channels IdentifiableMap[ChannelBindingsByName] `yaml:"channels"  validate:"required_if=Enabled true,dive,omitempty,min=1"`
+	BotToken string                                 `yaml:"botToken,omitempty"`
+	AppToken string                                 `yaml:"appToken,omitempty"`
+}
+
+// CloudSlack configuration for multi-slack support
+type CloudSlack struct {
+	Enabled                         bool                               `yaml:"enabled"`
+	Channels                        IdentifiableMap[CloudSlackChannel] `yaml:"channels"  validate:"required_if=Enabled true,dive,omitempty,min=1"`
+	Token                           string                             `yaml:"token"`
+	BotID                           string                             `yaml:"botID,omitempty"`
+	Server                          GRPCServer                         `yaml:"server"`
+	ExecutionEventStreamingDisabled bool                               `yaml:"executionEventStreamingDisabled"`
+}
+
+// GRPCServer config for gRPC server
+type GRPCServer struct {
+	URL                      string              `yaml:"url"`
+	DisableTransportSecurity bool                `yaml:"disableTransportSecurity"`
+	TLS                      GRPCServerTLSConfig `yaml:"tls"`
+}
+
+// GRPCServerTLSConfig describes gRPC server TLS configuration.m
+type GRPCServerTLSConfig struct {
+	CACertificate      []byte `yaml:"caCertificate,omitempty"`
+	UseSystemCertPool  bool   `yaml:"useSystemCertPool"`
+	InsecureSkipVerify bool   `yaml:"insecureSkipVerify"`
 }
 
 // Elasticsearch config auth settings
@@ -492,6 +542,7 @@ type Elasticsearch struct {
 	SkipTLSVerify bool                `yaml:"skipTLSVerify"`
 	AWSSigning    AWSSigning          `yaml:"awsSigning"`
 	Indices       map[string]ELSIndex `yaml:"indices"  validate:"required_if=Enabled true,dive,omitempty,min=1"`
+	LogLevel      string              `yaml:"logLevel"`
 }
 
 // AWSSigning contains AWS configurations
@@ -513,36 +564,44 @@ type ELSIndex struct {
 
 // Mattermost configuration to authentication and send notifications
 type Mattermost struct {
-	Enabled      bool                                   `yaml:"enabled"`
-	BotName      string                                 `yaml:"botName"`
-	URL          string                                 `yaml:"url"`
-	Token        string                                 `yaml:"token"`
-	Team         string                                 `yaml:"team"`
-	Channels     IdentifiableMap[ChannelBindingsByName] `yaml:"channels"  validate:"required_if=Enabled true,dive,omitempty,min=1"`
-	Notification Notification                           `yaml:"notification,omitempty"`
+	Enabled  bool                                   `yaml:"enabled"`
+	BotName  string                                 `yaml:"botName"`
+	URL      string                                 `yaml:"url"`
+	Token    string                                 `yaml:"token"`
+	Team     string                                 `yaml:"team"`
+	Channels IdentifiableMap[ChannelBindingsByName] `yaml:"channels"  validate:"required_if=Enabled true,dive,omitempty,min=1"`
 }
 
 // Teams creds for authentication with MS Teams
 type Teams struct {
-	Enabled     bool   `yaml:"enabled"`
-	BotName     string `yaml:"botName,omitempty"`
-	AppID       string `yaml:"appID,omitempty"`
-	AppPassword string `yaml:"appPassword,omitempty"`
-	Port        string `yaml:"port"`
-	MessagePath string `yaml:"messagePath,omitempty"`
-	// TODO: Be consistent with other communicators when MS Teams support multiple channels
-	//Channels     IdentifiableMap[ChannelBindingsByName] `yaml:"channels"`
-	Bindings     BotBindings  `yaml:"bindings" validate:"required_if=Enabled true"`
-	Notification Notification `yaml:"notification,omitempty"`
+	Enabled     bool        `yaml:"enabled"`
+	BotName     string      `yaml:"botName,omitempty"`
+	AppID       string      `yaml:"appID,omitempty"`
+	AppPassword string      `yaml:"appPassword,omitempty"`
+	Port        string      `yaml:"port"`
+	MessagePath string      `yaml:"messagePath,omitempty"`
+	Bindings    BotBindings `yaml:"bindings" validate:"required_if=Enabled true"`
+}
+
+// CloudTeams configuration for cloud MS Teams.
+type CloudTeams struct {
+	Enabled bool            `yaml:"enabled"`
+	BotName string          `yaml:"botName"`
+	Server  GRPCServer      `yaml:"server"`
+	Teams   []TeamsBindings `yaml:"teams" validate:"required_if=Enabled true,dive,omitempty,min=1"`
+}
+
+type TeamsBindings struct {
+	ID       string                               `yaml:"id"`
+	Channels IdentifiableMap[ChannelBindingsByID] `yaml:"channels" validate:"dive,omitempty,min=1"`
 }
 
 // Discord configuration for authentication and send notifications
 type Discord struct {
-	Enabled      bool                                 `yaml:"enabled"`
-	Token        string                               `yaml:"token"`
-	BotID        string                               `yaml:"botID"`
-	Channels     IdentifiableMap[ChannelBindingsByID] `yaml:"channels"  validate:"required_if=Enabled true,dive,omitempty,min=1"`
-	Notification Notification                         `yaml:"notification,omitempty"`
+	Enabled  bool                                 `yaml:"enabled"`
+	Token    string                               `yaml:"token"`
+	BotID    string                               `yaml:"botID"`
+	Channels IdentifiableMap[ChannelBindingsByID] `yaml:"channels"  validate:"required_if=Enabled true,dive,omitempty,min=1"`
 }
 
 // Webhook configuration to send notifications
@@ -552,47 +611,67 @@ type Webhook struct {
 	Bindings SinkBindings `yaml:"bindings" validate:"required_if=Enabled true"`
 }
 
-// Kubectl configuration for executing commands inside cluster
-type Kubectl struct {
-	Namespaces       Namespaces `yaml:"namespaces,omitempty"`
-	Enabled          bool       `yaml:"enabled"`
-	Commands         Commands   `yaml:"commands,omitempty"`
-	DefaultNamespace string     `yaml:"defaultNamespace,omitempty"`
-	RestrictAccess   *bool      `yaml:"restrictAccess,omitempty"`
-}
-
-// Commands allowed in bot
-type Commands struct {
-	Verbs     []string `yaml:"verbs"`
-	Resources []string `yaml:"resources"`
+// PagerDuty describes the PagerDuty sink.
+type PagerDuty struct {
+	// Enabled indicates if the PagerDuty sink is enabled.
+	Enabled bool `yaml:"enabled"`
+	// Bindings are the bindings for the PagerDuty sink.
+	Bindings SinkBindings `yaml:"bindings" validate:"required_if=Enabled true"`
+	// IntegrationKey is the PagerDuty integration key generated for Events v2 API.
+	IntegrationKey string `yaml:"integrationKey" validate:"required_if=Enabled true"`
+	// V2EventsAPIBasePath is the Events v2 API URL base path. Defaults to https://events.pagerduty.com.
+	V2EventsAPIBasePath string
 }
 
 // CfgWatcher describes configuration for watching the configuration.
 type CfgWatcher struct {
-	Enabled            bool          `yaml:"enabled"`
-	InitialSyncTimeout time.Duration `yaml:"initialSyncTimeout"`
-	TmpDir             string        `yaml:"tmpDir"`
+	Enabled   bool                `yaml:"enabled"`
+	Remote    RemoteCfgWatcher    `yaml:"remote"`
+	InCluster InClusterCfgWatcher `yaml:"inCluster"`
+
+	Deployment K8sResourceRef `yaml:"deployment"`
+}
+
+// RemoteCfgWatcher describes configuration for watching the configuration using remote config provider.
+type RemoteCfgWatcher struct {
+	PollInterval time.Duration `yaml:"pollInterval"`
+}
+
+// InClusterCfgWatcher describes configuration for watching the configuration using in-cluster config provider.
+type InClusterCfgWatcher struct {
+	InformerResyncPeriod time.Duration `yaml:"informerResyncPeriod"`
 }
 
 // Settings contains Botkube's related configuration.
 type Settings struct {
-	ClusterName           string           `yaml:"clusterName"`
-	UpgradeNotifier       bool             `yaml:"upgradeNotifier"`
-	SystemConfigMap       K8sResourceRef   `yaml:"systemConfigMap"`
-	PersistentConfig      PersistentConfig `yaml:"persistentConfig"`
-	MetricsPort           string           `yaml:"metricsPort"`
-	HealthPort            string           `yaml:"healthPort"`
-	LifecycleServer       LifecycleServer  `yaml:"lifecycleServer"`
-	Log                   loggerx.Config   `yaml:"log"`
-	InformersResyncPeriod time.Duration    `yaml:"informersResyncPeriod"`
-	Kubeconfig            string           `yaml:"kubeconfig"`
+	ClusterName             string           `yaml:"clusterName"`
+	UpgradeNotifier         bool             `yaml:"upgradeNotifier"`
+	SystemConfigMap         K8sResourceRef   `yaml:"systemConfigMap"`
+	PersistentConfig        PersistentConfig `yaml:"persistentConfig"`
+	MetricsPort             string           `yaml:"metricsPort"`
+	HealthPort              string           `yaml:"healthPort"`
+	Log                     Logger           `yaml:"log"`
+	InformersResyncPeriod   time.Duration    `yaml:"informersResyncPeriod"`
+	Kubeconfig              string           `yaml:"kubeconfig"`
+	SACredentialsPathPrefix string           `yaml:"saCredentialsPathPrefix"`
 }
 
-// LifecycleServer contains configuration for the server with app lifecycle methods.
-type LifecycleServer struct {
-	Enabled    bool           `yaml:"enabled"`
-	Port       int            `yaml:"port"` // String for consistency
-	Deployment K8sResourceRef `yaml:"deployment"`
+// Formatter log formatter
+type Formatter string
+
+const (
+	// FormatterText text formatter for logging
+	FormatterText Formatter = "text"
+
+	// FormatterJSON json formatter for logging
+	FormatterJSON Formatter = "json"
+)
+
+// Logger holds logger configuration parameters.
+type Logger struct {
+	Level         string    `yaml:"level"`
+	DisableColors bool      `yaml:"disableColors"`
+	Formatter     Formatter `yaml:"formatter"`
 }
 
 // PersistentConfig contains configuration for persistent storage.
@@ -649,7 +728,20 @@ func LoadWithDefaults(configs [][]byte) (*Config, LoadWithDefaultsDetails, error
 	}
 
 	var cfg Config
-	err = k.Unmarshal("", &cfg)
+	err = k.UnmarshalWithConf("", &cfg, koanf.UnmarshalConf{
+		DecoderConfig: &mapstructure.DecoderConfig{
+			Squash: true, // needed to properly unmarshal CloudSlack channel's ChannelBindingsByName
+
+			// also use defaults from koanf.UnmarshalWithConf
+			DecodeHook: mapstructure.ComposeDecodeHookFunc(
+				mapstructure.StringToTimeDurationHookFunc(),
+				mapstructure.StringToSliceHookFunc(","),
+				mapstructure.TextUnmarshallerHookFunc()),
+			Metadata:         nil,
+			Result:           &cfg,
+			WeaklyTypedInput: true,
+		},
+	})
 	if err != nil {
 		return nil, LoadWithDefaultsDetails{}, err
 	}
@@ -665,25 +757,6 @@ func LoadWithDefaults(configs [][]byte) (*Config, LoadWithDefaultsDetails, error
 	return &cfg, LoadWithDefaultsDetails{
 		ValidateWarnings: result.Warnings.ErrorOrNil(),
 	}, nil
-}
-
-// FromProvider resolves and returns paths for config files.
-// It reads them the 'BOTKUBE_CONFIG_PATHS' env variable. If not found, then it uses '--config' flag.
-func FromProvider(gql *config.GqlClient) (config.YAMLFiles, error) {
-	var provider config.Provider
-	if os.Getenv("CONFIG_PROVIDER_IDENTIFIER") != "" {
-		provider = config.NewGqlProvider(*gql)
-	} else if os.Getenv("BOTKUBE_CONFIG_PATHS") != "" {
-		provider = config.NewEnvProvider()
-	} else {
-		provider = config.NewFileSystemProvider(configPathsFlag)
-	}
-	return provider.Configs(context.Background())
-}
-
-// RegisterFlags registers config related flags.
-func RegisterFlags(flags *pflag.FlagSet) {
-	flags.StringSliceVarP(&configPathsFlag, "config", "c", nil, "Specify configuration file in YAML format (can specify multiple).")
 }
 
 func normalizeConfigEnvName(name string) string {

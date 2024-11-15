@@ -3,16 +3,29 @@ package bot
 import (
 	"context"
 
+	"github.com/kubeshop/botkube/internal/analytics"
+	"github.com/kubeshop/botkube/internal/health"
 	"github.com/kubeshop/botkube/pkg/config"
 	"github.com/kubeshop/botkube/pkg/execute"
 	"github.com/kubeshop/botkube/pkg/notifier"
 )
 
+const (
+	platformMessageWorkersCount = 10
+	platformMessageChannelSize  = 100
+)
+
 // Bot connects to communication channels and reads/sends messages. It is a two-way integration.
 type Bot interface {
 	Start(ctx context.Context) error
-	BotName() string
-	notifier.Notifier
+	GetStatus() health.PlatformStatus
+	notifier.Bot
+}
+
+type Status struct {
+	Status   health.PlatformStatusMsg
+	Restarts string
+	Reason   health.FailureReasonMsg
 }
 
 // ExecutorFactory facilitates creation of execute.Executor instances.
@@ -23,7 +36,7 @@ type ExecutorFactory interface {
 // AnalyticsReporter defines a reporter that collects analytics data.
 type AnalyticsReporter interface {
 	// ReportBotEnabled reports an enabled bot.
-	ReportBotEnabled(platform config.CommPlatformIntegration) error
+	ReportBotEnabled(platform config.CommPlatformIntegration, commGroupIdx int) error
 }
 
 // FatalErrorAnalyticsReporter reports a fatal errors.
@@ -37,11 +50,18 @@ type FatalErrorAnalyticsReporter interface {
 	Close() error
 }
 
+// AnalyticsCommandReporter defines a reporter that collects analytics data.
+type AnalyticsCommandReporter interface {
+	FatalErrorAnalyticsReporter
+	ReportCommand(in analytics.ReportCommandInput) error
+}
+
 type channelConfigByID struct {
 	config.ChannelBindingsByID
 
 	alias  string
 	notify bool
+	name   string
 }
 
 type channelConfigByName struct {
@@ -49,4 +69,17 @@ type channelConfigByName struct {
 
 	alias  string
 	notify bool
+}
+
+type CommGroupMetadata struct {
+	Name  string
+	Index int
+}
+
+func AsNotifiers(bots map[string]Bot) []notifier.Bot {
+	notifiers := make([]notifier.Bot, 0, len(bots))
+	for _, bot := range bots {
+		notifiers = append(notifiers, bot)
+	}
+	return notifiers
 }

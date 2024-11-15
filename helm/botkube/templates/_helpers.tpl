@@ -50,10 +50,8 @@ Create the name of the service account to use
 {{- .Values.ssl.existingSecretName | default (printf "%s-certificate-secret" (include "botkube.fullname" .)) -}}
 {{- end -}}
 
-{{- define "botkube.communication.team.enabled" -}}
-{{- range $key, $val := .Values.communications -}}
-{{- if $val.teams.enabled -}}
-  {{- true -}}
-{{- end -}}
+{{- define "botkube.remoteConfigEnabled" -}}
+{{ if .Values.config.provider.identifier }}
+    {{- true -}}
 {{- end -}}
 {{- end -}}

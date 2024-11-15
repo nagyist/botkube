@@ -5,17 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 	"sync"
 
-	"github.com/mattermost/mattermost-server/v6/model"
+	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/sirupsen/logrus"
+	"github.com/sourcegraph/conc/pool"
 
+	"github.com/kubeshop/botkube/internal/health"
+	"github.com/kubeshop/botkube/pkg/api"
 	"github.com/kubeshop/botkube/pkg/bot/interactive"
 	"github.com/kubeshop/botkube/pkg/config"
-	"github.com/kubeshop/botkube/pkg/event"
 	"github.com/kubeshop/botkube/pkg/execute"
 	"github.com/kubeshop/botkube/pkg/execute/command"
 	"github.com/kubeshop/botkube/pkg/multierror"
@@ -38,6 +41,7 @@ const (
 
 	httpsScheme                  = "https"
 	mattermostBotMentionRegexFmt = "^@(?i)%s"
+	responseFileName             = "response.txt"
 )
 
 // TODO:
@@ -46,115 +50,148 @@ const (
 
 // Mattermost listens for user's message, execute commands and sends back the response.
 type Mattermost struct {
-	log             logrus.FieldLogger
-	executorFactory ExecutorFactory
-	reporter        AnalyticsReporter
-	notification    config.Notification
-	serverURL       string
-	botName         string
-	teamName        string
-	webSocketURL    string
-	wsClient        *model.WebSocketClient
-	apiClient       *model.Client4
-	channelsMutex   sync.RWMutex
-	commGroupName   string
-	channels        map[string]channelConfigByID
-	notifyMutex     sync.Mutex
-	botMentionRegex *regexp.Regexp
-	mdFormatter     interactive.MDFormatter
+	log               logrus.FieldLogger
+	executorFactory   ExecutorFactory
+	reporter          AnalyticsReporter
+	serverURL         string
+	botName           string
+	botUserID         string
+	teamName          string
+	webSocketURL      string
+	wsClient          *model.WebSocketClient
+	apiClient         *model.Client4
+	channelsMutex     sync.RWMutex
+	commGroupMetadata CommGroupMetadata
+	channels          map[string]channelConfigByID
+	notifyMutex       sync.Mutex
+	botMentionRegex   *regexp.Regexp
+	renderer          *MattermostRenderer
+	userNamesForID    map[string]string
+	messages          chan mattermostMessage
+	messageWorkers    *pool.Pool
+	shutdownOnce      sync.Once
+	status            health.PlatformStatusMsg
+	failureReason     health.FailureReasonMsg
+	errorMsg          string
 }
 
 // mattermostMessage contains message details to execute command and send back the result
 type mattermostMessage struct {
-	Event         *model.WebSocketEvent
-	IsAuthChannel bool
+	Event *model.WebSocketEvent
 }
 
 // NewMattermost creates a new Mattermost instance.
-func NewMattermost(log logrus.FieldLogger, commGroupName string, cfg config.Mattermost, executorFactory ExecutorFactory, reporter AnalyticsReporter) (*Mattermost, error) {
+func NewMattermost(ctx context.Context, log logrus.FieldLogger, commGroupMetadata CommGroupMetadata, cfg config.Mattermost, executorFactory ExecutorFactory, reporter AnalyticsReporter) (*Mattermost, error) {
 	botMentionRegex, err := mattermostBotMentionRegex(cfg.BotName)
 	if err != nil {
 		return nil, err
 	}
 
-	checkURL, err := url.Parse(cfg.URL)
+	mmURL := strings.TrimRight(cfg.URL, "/") // This is already done in `model.NewWebSocketClient4`, but we also need it for WebSocket connection
+	checkURL, err := url.Parse(mmURL)
 	if err != nil {
-		return nil, fmt.Errorf("while parsing Mattermost URL %q: %w", cfg.URL, err)
+		return nil, fmt.Errorf("while parsing Mattermost URL %q: %w", mmURL, err)
 	}
 
 	// Create WebSocketClient and handle messages
-	webSocketURL := WebSocketProtocol + checkURL.Host
+	webSocketURL := WebSocketProtocol + checkURL.Host + checkURL.Path
 	if checkURL.Scheme == httpsScheme {
-		webSocketURL = WebSocketSecureProtocol + checkURL.Host
+		webSocketURL = WebSocketSecureProtocol + checkURL.Host + checkURL.Path
 	}
 
-	client := model.NewAPIv4Client(cfg.URL)
+	log.WithFields(logrus.Fields{
+		"webSocketURL": webSocketURL,
+		"apiURL":       mmURL,
+	}).Debugf("Setting up Mattermost bot...")
+
+	client := model.NewAPIv4Client(mmURL)
 	client.SetOAuthToken(cfg.Token)
 
-	botTeams, _, err := client.SearchTeams(&model.TeamSearch{
-		Term: cfg.Team,
-	})
+	// In Mattermost v7.0+, what we see in MM Console is `display_name` of a team.
+	// We need `name` of the team to make the rest of the business logic work.
+	team, err := getMattermostTeam(ctx, client, cfg.Team)
 	if err != nil {
-		return nil, fmt.Errorf("while getting team by name: %w", err)
+		return nil, fmt.Errorf("while getting team details: %w", err)
 	}
 
-	if len(botTeams) == 0 {
-		return nil, fmt.Errorf("team: %s not found", cfg.Team)
-	}
-	botTeam := botTeams[0]
-	// In Mattermost v7.0+, what we see in MM Console is `display_name` of team.
-	// We need `name` of team to make rest of the business logic work.
-	cfg.Team = botTeam.Name
-	channelsByIDCfg, err := mattermostChannelsCfgFrom(client, botTeam.Id, cfg.Channels)
+	channelsByIDCfg, err := mattermostChannelsCfgFrom(ctx, client, team.Id, cfg.Channels)
 	if err != nil {
 		return nil, fmt.Errorf("while producing channels configuration map by ID: %w", err)
 	}
 
+	botUserID, err := getBotUserID(ctx, client, team.Id, cfg.BotName)
+	if err != nil {
+		return nil, fmt.Errorf("while getting bot user ID: %w", err)
+	}
+
 	return &Mattermost{
-		log:             log,
-		executorFactory: executorFactory,
-		reporter:        reporter,
-		notification:    cfg.Notification,
-		serverURL:       cfg.URL,
-		botName:         cfg.BotName,
-		teamName:        cfg.Team,
-		apiClient:       client,
-		webSocketURL:    webSocketURL,
-		commGroupName:   commGroupName,
-		channels:        channelsByIDCfg,
-		botMentionRegex: botMentionRegex,
-		mdFormatter:     interactive.DefaultMDFormatter(),
+		log:               log,
+		executorFactory:   executorFactory,
+		reporter:          reporter,
+		serverURL:         cfg.URL,
+		botName:           cfg.BotName,
+		botUserID:         botUserID,
+		teamName:          team.Name,
+		apiClient:         client,
+		webSocketURL:      webSocketURL,
+		commGroupMetadata: commGroupMetadata,
+		channels:          channelsByIDCfg,
+		botMentionRegex:   botMentionRegex,
+		renderer:          NewMattermostRenderer(),
+		userNamesForID:    map[string]string{},
+		messages:          make(chan mattermostMessage, platformMessageChannelSize),
+		messageWorkers:    pool.New().WithMaxGoroutines(platformMessageWorkersCount),
+		status:            health.StatusUnknown,
+		failureReason:     "",
 	}, nil
 }
 
-// Start establishes mattermost connection and listens for messages
+func (b *Mattermost) startMessageProcessor(ctx context.Context) {
+	b.log.Info("Starting mattermost message processor...")
+	defer b.log.Info("Stopped mattermost message processor...")
+
+	for msg := range b.messages {
+		b.messageWorkers.Go(func() {
+			err := b.handleMessage(ctx, msg)
+			if err != nil {
+				b.log.WithError(err).Error("Failed to handle Mattermost message")
+			}
+		})
+	}
+} // Start establishes mattermost connection and listens for messages
 func (b *Mattermost) Start(ctx context.Context) error {
 	b.log.Info("Starting bot")
 
 	// Check connection to Mattermost server
-	err := b.checkServerConnection()
+	err := b.checkServerConnection(ctx)
 	if err != nil {
+		b.setStatusReason(health.FailureReasonConnectionError, fmt.Sprintf("while pinging Mattermost server %q: %s", b.serverURL, err.Error()))
 		return fmt.Errorf("while pinging Mattermost server %q: %w", b.serverURL, err)
 	}
 
-	err = b.reporter.ReportBotEnabled(b.IntegrationName())
+	err = b.reporter.ReportBotEnabled(b.IntegrationName(), b.commGroupMetadata.Index)
 	if err != nil {
-		return fmt.Errorf("while reporting analytics: %w", err)
+		b.log.Errorf("report analytics error: %s", err.Error())
 	}
 
 	// It is observed that Mattermost server closes connections unexpectedly after some time.
 	// For now, we are adding retry logic to reconnect to the server
 	// https://github.com/kubeshop/botkube/issues/201
 	b.log.Info("Botkube connected to Mattermost!")
+	b.setStatusReason("", "")
+	go b.startMessageProcessor(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
 			b.log.Info("Shutdown requested. Finishing...")
+			b.shutdown()
 			return nil
 		default:
 			var appErr error
 			b.wsClient, appErr = model.NewWebSocketClient4(b.webSocketURL, b.apiClient.AuthToken)
 			if appErr != nil {
+				b.setStatusReason(health.FailureReasonConnectionError, fmt.Sprintf("while creating WebSocket connection: %s", appErr.Error()))
 				return fmt.Errorf("while creating WebSocket connection: %w", appErr)
 			}
 			b.listen(ctx)
@@ -202,10 +239,15 @@ func (b *Mattermost) SetNotificationsEnabled(channelID string, enabled bool) err
 }
 
 // Check incoming message and take action
-func (b *Mattermost) handleMessage(ctx context.Context, mm *mattermostMessage) error {
+func (b *Mattermost) handleMessage(ctx context.Context, mm mattermostMessage) error {
 	post, err := postFromEvent(mm.Event)
 	if err != nil {
 		return fmt.Errorf("while getting post from event: %w", err)
+	}
+
+	// Skip if message posted by Botkube
+	if post.UserId == b.botUserID {
+		return nil
 	}
 
 	// Handle message only if starts with mention
@@ -219,24 +261,43 @@ func (b *Mattermost) handleMessage(ctx context.Context, mm *mattermostMessage) e
 
 	channelID := mm.Event.GetBroadcast().ChannelId
 	channel, exists := b.getChannels()[channelID]
-	mm.IsAuthChannel = exists
+	if !exists {
+		channel = channelConfigByID{
+			ChannelBindingsByID: config.ChannelBindingsByID{
+				ID: channelID,
+			},
+		}
+	}
+
+	userName, err := b.getUserName(ctx, post.UserId)
+	if err != nil {
+		b.log.Errorf("while getting user name: %s", err.Error())
+	}
+	if userName == "" {
+		userName = post.UserId
+	}
 
 	e := b.executorFactory.NewDefault(execute.NewDefaultInput{
-		CommGroupName:   b.commGroupName,
+		CommGroupName:   b.commGroupMetadata.Name,
 		Platform:        b.IntegrationName(),
 		NotifierHandler: b,
 		Conversation: execute.Conversation{
 			Alias:            channel.alias,
+			DisplayName:      channel.name,
 			ID:               channel.Identifier(),
 			ExecutorBindings: channel.Bindings.Executors,
 			SourceBindings:   channel.Bindings.Sources,
-			IsAuthenticated:  mm.IsAuthChannel,
+			IsKnown:          exists,
 			CommandOrigin:    command.TypedOrigin,
+		},
+		User: execute.UserInput{
+			//Mention:     "", // not used currently
+			DisplayName: userName,
 		},
 		Message: req,
 	})
 	response := e.Execute(ctx)
-	err = b.send(channelID, response)
+	err = b.send(ctx, channelID, response)
 	if err != nil {
 		return fmt.Errorf("while sending message: %w", err)
 	}
@@ -245,78 +306,83 @@ func (b *Mattermost) handleMessage(ctx context.Context, mm *mattermostMessage) e
 }
 
 // Send messages to Mattermost
-func (b *Mattermost) send(channelID string, resp interactive.Message) error {
-	b.log.Debugf("Mattermost Response: %s", resp)
+func (b *Mattermost) send(ctx context.Context, channelID string, resp interactive.CoreMessage) error {
+	b.log.Debugf("Sending message to channel %q: %+v", channelID, resp)
 
-	markdown := interactive.RenderMessage(b.mdFormatter, resp)
-
-	if len(markdown) == 0 {
-		return errors.New("while reading Mattermost response: empty response")
+	resp.ReplaceBotNamePlaceholder(b.BotName())
+	post, err := b.formatMessage(ctx, resp, channelID)
+	if err != nil {
+		return fmt.Errorf("while formatting message: %w", err)
 	}
 
-	// Create file if message is too large
-	if len(markdown) >= mattermostMaxMessageSize {
+	if _, _, err := b.apiClient.CreatePost(ctx, post); err != nil {
+		b.log.Error("Failed to send message. Error: ", err)
+	}
+
+	b.log.Debugf("Message successfully sent to channel %q", channelID)
+	return nil
+}
+
+func (b *Mattermost) formatMessage(ctx context.Context, msg interactive.CoreMessage, channelID string) (*model.Post, error) {
+	// 1. Check the size and upload message as a file if it's too long
+	plaintext := interactive.MessageToPlaintext(msg, interactive.NewlineFormatter)
+	if len(plaintext) == 0 {
+		return nil, errors.New("while reading Mattermost response: empty response")
+	}
+	if len(plaintext) >= mattermostMaxMessageSize {
 		uploadResponse, _, err := b.apiClient.UploadFileAsRequestBody(
-			[]byte(interactive.MessageToPlaintext(resp, interactive.NewlineFormatter)),
+			ctx,
+			[]byte(plaintext),
 			channelID,
 			responseFileName,
 		)
 		if err != nil {
-			return fmt.Errorf("while uploading file: %w", err)
+			return nil, fmt.Errorf("while uploading file: %w", err)
 		}
 
-		post := &model.Post{}
-		post.ChannelId = channelID
-		post.Message = resp.Description
-		post.FileIds = []string{uploadResponse.FileInfos[0].Id}
-
-		if _, _, err := b.apiClient.CreatePost(post); err != nil {
-			return fmt.Errorf("while sending attachment message: %w", err)
-		}
-
-		return nil
+		return &model.Post{
+			ChannelId: channelID,
+			Message:   msg.Description,
+			FileIds:   []string{uploadResponse.FileInfos[0].Id},
+		}, nil
 	}
 
-	post := &model.Post{}
-	post.ChannelId = channelID
-	post.Message = markdown
-	if _, _, err := b.apiClient.CreatePost(post); err != nil {
-		b.log.Error("Failed to send message. Error: ", err)
+	// 2. If it's not a simplified event, render as markdown
+	if msg.Type != api.NonInteractiveSingleSection {
+		return &model.Post{
+			ChannelId: channelID,
+			Message:   b.renderer.MessageToMarkdown(msg),
+		}, nil
 	}
-	return nil
+
+	// TODO: For now, we just render only with a few fields that are always present in the event message.
+	// This should be removed once we will add support for rendering AdaptiveCard with all message primitives.
+	attachments, err := b.renderer.NonInteractiveSectionToCard(msg)
+	if err != nil {
+		return nil, fmt.Errorf("while rendering event message embed: %w", err)
+	}
+
+	return &model.Post{
+		Props: map[string]interface{}{
+			"attachments": attachments,
+		},
+		ChannelId: channelID,
+	}, nil
 }
 
 // Check if Mattermost server is reachable
-func (b *Mattermost) checkServerConnection() error {
+func (b *Mattermost) checkServerConnection(ctx context.Context) error {
 	// Check api connection
-	if _, _, err := b.apiClient.GetOldClientConfig(""); err != nil {
+	if _, _, err := b.apiClient.GetOldClientConfig(ctx, ""); err != nil {
 		return err
 	}
 
 	// Get channel list
-	_, _, err := b.apiClient.GetTeamByName(b.teamName, "")
+	_, _, err := b.apiClient.GetTeamByName(ctx, b.teamName, "")
 	if err != nil {
 		return err
 	}
 	return nil
-}
-
-// Check if team exists in Mattermost
-func (b *Mattermost) getTeam() *model.Team {
-	botTeam, _, err := b.apiClient.GetTeamByName(b.teamName, "")
-	if err != nil {
-		b.log.Fatalf("There was a problem finding Mattermost team %s. %s", b.teamName, err)
-	}
-	return botTeam
-}
-
-// Check if Botkube user exists in Mattermost
-func (b *Mattermost) getUser() *model.User {
-	users, _, err := b.apiClient.AutocompleteUsersInTeam(b.getTeam().Id, b.botName, 1, "")
-	if err != nil {
-		b.log.Fatalf("There was a problem finding Mattermost user %s. %s", b.botName, err)
-	}
-	return users.Users[0]
 }
 
 func (b *Mattermost) listen(ctx context.Context) {
@@ -347,61 +413,12 @@ func (b *Mattermost) listen(ctx context.Context) {
 				continue
 			}
 
-			post, err := postFromEvent(event)
-			if err != nil {
-				continue
+			mm := mattermostMessage{
+				Event: event,
 			}
-
-			// Skip if message posted by Botkube or doesn't start with mention
-			if post.UserId == b.getUser().Id {
-				continue
-			}
-			mm := &mattermostMessage{
-				Event:         event,
-				IsAuthChannel: false,
-			}
-			err = b.handleMessage(ctx, mm)
-			if err != nil {
-				wrappedErr := fmt.Errorf("while handling message: %w", err)
-				b.log.Errorf(wrappedErr.Error())
-			}
+			b.messages <- mm
 		}
 	}
-}
-
-// SendEvent sends event notification to Mattermost
-func (b *Mattermost) SendEvent(_ context.Context, event event.Event, eventSources []string) error {
-	b.log.Debugf("Sending to Mattermost: %+v", event)
-	attachment := b.formatAttachments(event)
-
-	errs := multierror.New()
-	for _, channelID := range b.getChannelsToNotifyForEvent(event, eventSources) {
-		post := &model.Post{
-			Props: map[string]interface{}{
-				"attachments": attachment,
-			},
-			ChannelId: channelID,
-		}
-
-		_, _, err := b.apiClient.CreatePost(post)
-		if err != nil {
-			errs = multierror.Append(errs, fmt.Errorf("while posting message to channel %q: %w", channelID, err))
-			continue
-		}
-
-		b.log.Debugf("Event successfully sent to channel %q", post.ChannelId)
-	}
-
-	return errs.ErrorOrNil()
-}
-
-func (b *Mattermost) getChannelsToNotifyForEvent(event event.Event, sourceBindings []string) []string {
-	// support custom event routing
-	if event.Channel != "" {
-		return []string{event.Channel}
-	}
-
-	return b.getChannelsToNotify(sourceBindings)
 }
 
 func (b *Mattermost) getChannelsToNotify(eventSources []string) []string {
@@ -419,40 +436,30 @@ func (b *Mattermost) getChannelsToNotify(eventSources []string) []string {
 	return out
 }
 
-// SendGenericMessage sends message to selected Mattermost channels.
-func (b *Mattermost) SendGenericMessage(_ context.Context, genericMsg interactive.GenericMessage, sourceBindings []string) error {
-	msg := genericMsg.ForBot(b.BotName())
-
+// SendMessage sends message to selected Mattermost channels.
+func (b *Mattermost) SendMessage(ctx context.Context, msg interactive.CoreMessage, sourceBindings []string) error {
 	errs := multierror.New()
 	for _, channelID := range b.getChannelsToNotify(sourceBindings) {
-		b.log.Debugf("Sending message to channel %q: %+v", channelID, msg)
-		err := b.send(channelID, msg)
+		err := b.send(ctx, channelID, msg)
 		if err != nil {
-			errs = multierror.Append(errs, fmt.Errorf("while sending Slack message to channel %q: %w", channelID, err))
+			errs = multierror.Append(errs, fmt.Errorf("while sending Mattermost message to channel %q: %w", channelID, err))
 			continue
 		}
-		b.log.Debugf("Message successfully sent to channel %q", channelID)
 	}
 
 	return errs.ErrorOrNil()
 }
 
 // SendMessageToAll sends message to all Mattermost channels.
-func (b *Mattermost) SendMessageToAll(_ context.Context, msg interactive.Message) error {
+func (b *Mattermost) SendMessageToAll(ctx context.Context, msg interactive.CoreMessage) error {
 	errs := multierror.New()
 	for _, channel := range b.getChannels() {
 		channelID := channel.ID
-		plaintext := interactive.RenderMessage(b.mdFormatter, msg)
-		b.log.Debugf("Sending message to channel %q: %+v", channelID, plaintext)
-		post := &model.Post{
-			ChannelId: channelID,
-			Message:   plaintext,
+		err := b.send(ctx, channelID, msg)
+		if err != nil {
+			errs = multierror.Append(errs, fmt.Errorf("while sending Mattermost message to channel %q: %w", channelID, err))
+			continue
 		}
-		if _, _, err := b.apiClient.CreatePost(post); err != nil {
-			errs = multierror.Append(errs, fmt.Errorf("while creating a post: %w", err))
-		}
-
-		b.log.Debugf("Message successfully sent to channel %q", channelID)
 	}
 	return errs.ErrorOrNil()
 }
@@ -482,10 +489,76 @@ func (b *Mattermost) setChannels(channels map[string]channelConfigByID) {
 	b.channels = channels
 }
 
-func mattermostChannelsCfgFrom(client *model.Client4, teamID string, channelsCfg config.IdentifiableMap[config.ChannelBindingsByName]) (map[string]channelConfigByID, error) {
+func (b *Mattermost) getUserName(ctx context.Context, userID string) (string, error) {
+	userName, exists := b.userNamesForID[userID]
+	if exists {
+		return userName, nil
+	}
+
+	user, _, err := b.apiClient.GetUser(ctx, userID, "")
+	if err != nil {
+		return "", fmt.Errorf("while getting user with ID %q: %w", userID, err)
+	}
+	b.userNamesForID[userID] = user.Username
+
+	return user.Username, nil
+}
+
+func (b *Mattermost) shutdown() {
+	b.shutdownOnce.Do(func() {
+		b.log.Info("Shutting down mattermost message processor...")
+		close(b.messages)
+		b.messageWorkers.Wait()
+	})
+}
+
+func getBotUserID(ctx context.Context, client *model.Client4, teamID, botName string) (string, error) {
+	users, _, err := client.GetUsersByUsernames(ctx, []string{botName})
+	if err != nil {
+		return "", fmt.Errorf("while getting user with name %q: %w", botName, err)
+	}
+
+	if len(users) == 0 {
+		return "", fmt.Errorf("user with name %q not found", botName)
+	}
+
+	teamMember, _, err := client.GetTeamMember(ctx, teamID, users[0].Id, "")
+	if err != nil {
+		return "", fmt.Errorf("while validating user with name %q is in team %q: %w", botName, teamID, err)
+	}
+
+	return teamMember.UserId, nil
+}
+
+func getMattermostTeam(ctx context.Context, client *model.Client4, name string) (*model.Team, error) {
+	botTeams, r, err := client.SearchTeams(ctx, &model.TeamSearch{
+		Term: name, // the search term to match against the name or display name of teams
+	})
+	if err != nil {
+		return nil, fmt.Errorf("while searching team by term: %w", err)
+	}
+
+	if r.StatusCode == http.StatusNotImplemented || len(botTeams) == 0 {
+		// try to check if we can get a given team directly
+		botTeam, _, err := client.GetTeamByName(ctx, name, "")
+		if err != nil {
+			return nil, fmt.Errorf("while getting team by name: %w", err)
+		}
+		botTeams = append(botTeams, botTeam)
+	}
+	if len(botTeams) == 0 {
+		return nil, fmt.Errorf("team %q not found", name)
+	}
+
+	return botTeams[0], err
+}
+
+func mattermostChannelsCfgFrom(ctx context.Context, client *model.Client4, teamID string, channelsCfg config.IdentifiableMap[config.ChannelBindingsByName]) (map[string]channelConfigByID, error) {
 	res := make(map[string]channelConfigByID)
 	for channAlias, channCfg := range channelsCfg {
-		fetchedChannel, _, err := client.GetChannelByName(channCfg.Identifier(), teamID, "")
+		// do not normalize channel as Mattermost allows virtually all characters in channel names
+		// See https://docs.mattermost.com/channels/channel-naming-conventions.html
+		fetchedChannel, _, err := client.GetChannelByName(ctx, channCfg.Identifier(), teamID, "")
 		if err != nil {
 			return nil, fmt.Errorf("while getting channel by name %q: %w", channCfg.Name, err)
 		}
@@ -497,6 +570,7 @@ func mattermostChannelsCfgFrom(client *model.Client4, teamID string, channelsCfg
 			},
 			alias:  channAlias,
 			notify: !channCfg.Notification.Disabled,
+			name:   channCfg.Identifier(),
 		}
 	}
 
@@ -518,4 +592,24 @@ func postFromEvent(event *model.WebSocketEvent) (*model.Post, error) {
 		return nil, fmt.Errorf("while getting post from event: %w", err)
 	}
 	return post, nil
+}
+
+func (b *Mattermost) setStatusReason(reason health.FailureReasonMsg, errorMsg string) {
+	if reason == "" {
+		b.status = health.StatusHealthy
+	} else {
+		b.status = health.StatusUnHealthy
+	}
+	b.failureReason = reason
+	b.errorMsg = errorMsg
+}
+
+// GetStatus gets bot status.
+func (b *Mattermost) GetStatus() health.PlatformStatus {
+	return health.PlatformStatus{
+		Status:   b.status,
+		Restarts: "0/0",
+		Reason:   b.failureReason,
+		ErrorMsg: b.errorMsg,
+	}
 }

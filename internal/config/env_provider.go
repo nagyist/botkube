@@ -4,6 +4,13 @@ import (
 	"context"
 	"os"
 	"strings"
+
+	"github.com/kubeshop/botkube/pkg/config"
+)
+
+const (
+	// EnvProviderConfigPathsEnvKey holds config paths separated by comma.
+	EnvProviderConfigPathsEnvKey = "BOTKUBE_CONFIG_PATHS"
 )
 
 // EnvProvider environment config source provider
@@ -16,8 +23,8 @@ func NewEnvProvider() *EnvProvider {
 }
 
 // Configs returns list of config file locations
-func (e *EnvProvider) Configs(ctx context.Context) (YAMLFiles, error) {
-	envCfgs := os.Getenv("BOTKUBE_CONFIG_PATHS")
+func (e *EnvProvider) Configs(ctx context.Context) (config.YAMLFiles, int, error) {
+	envCfgs := os.Getenv(EnvProviderConfigPathsEnvKey)
 	configPaths := strings.Split(envCfgs, ",")
 
 	return NewFileSystemProvider(configPaths).Configs(ctx)
